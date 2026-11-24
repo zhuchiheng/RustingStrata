@@ -21,9 +21,6 @@ use super::forward::Inkling2Model;
 struct DsparkLayer {
     swa: bool,
     dflare_norm: Vec<f32>,
-    /// Newer exports (`dflash.has_markov_context = 1`) fuse the 4 target features with a per-layer 4-vector
-    /// (`blk.N.ctx_mix`) instead of a row of the shared `dspark_fuse` matrix.
-    ctx_mix: Option<Vec<f32>>,
     attn_k_ctx: Mat<'static>,
     attn_v_ctx: Mat<'static>,
     attn_k_ctx_norm: Vec<f32>,
@@ -40,6 +37,18 @@ struct DsparkLayer {
     ffn_down: Mat<'static>,
 }
 
+struct MarkovW2Gpu {
+    w2: crate::backend::GpuTensor,
+    bias: crate::backend::Buf,
+}
+
+enum MarkovHead {
+    /// Legacy Unsloth DSpark: projects `latent` (`[rank]`) to hidden space (`[n_embd]`), adds `h_row`, then runs target LM head.
+    HiddenOut { weight: Mat<'static>, bias: Vec<f32> },
+    /// Mainline llama.cpp DSpark: adds low-rank logit delta `markov_w2 @ latent + bias` onto batched target LM head logits.
+    Logits { w2: Mat<'static>, bias: Vec<f32>, gpu: std::sync::OnceLock<Option<MarkovW2Gpu>> },
+}
+
 pub struct DsparkDrafter {
     pub n_layer: usize,
     pub n_embd: usize,
@@ -54,20 +63,14 @@ pub struct DsparkDrafter {
     pub rope_theta: f32,
     pub target_layers: [usize; 4],
     fuse: Vec<f32>,
-    /// Present in the newer export: `markov_w2` maps the Markov latent to a per-vocabulary logit bias, which is added
-    /// to the target LM head's logits (the old export instead ran `dspark_hidden_out` into the LM head).
-    markov_w2: Option<Mat<'static>>,
-    markov_w2_b: Option<Vec<f32>>,
-    /// `markov_ctx_mix` of the newer export: the 4-vector that fuses target features for the committed context.
-    markov_ctx_mix: Option<Vec<f32>>,
     dspark_norm: Vec<f32>,
+    token_embd_norm: Option<Vec<f32>>,
     mask_embd: Vec<f32>,
     output_norm: Vec<f32>,
     markov_w1: Mat<'static>,
     joint_proj: Mat<'static>,
     joint_proj_b: Vec<f32>,
-    hidden_out: Mat<'static>,
-    hidden_out_b: Vec<f32>,
+    markov_head: MarkovHead,
     layers: Vec<DsparkLayer>,
     k_cache: Vec<Vec<f32>>,
     v_cache: Vec<Vec<f32>>,
@@ -131,43 +134,62 @@ impl DsparkDrafter {
 
         let markov_w1 = host_mat(g_ref, "markov_w1.weight")?;
         let rank = markov_w1.cols;
-        // Two exports exist. The older one has a shared `dspark_fuse` [4, n_layer + 1] matrix and projects the Markov
-        // latent through `dspark_hidden_out` into the LM head. The newer one (`dflash.has_markov_context = 1`, what
-        // unsloth ships today) fuses per layer with `blk.N.ctx_mix` + `markov_ctx_mix` and adds a `markov_w2`
-        // per-vocabulary bias to the target's logits. `has_ctx` picks the path.
-        let has_ctx = g_ref.get("dflash.has_markov_context").ok().and_then(|v| v.as_u64()).unwrap_or(0) != 0
-            || g_ref.tensors.contains_key("markov_ctx_mix.weight");
-        let (fuse, markov_ctx_mix, markov_w2, markov_w2_b, hidden_out, hidden_out_b, dspark_norm) = if has_ctx {
-            let w2 = host_mat(g_ref, "markov_w2.weight")?;
-            let w2b = f32s(g_ref, "markov_w2.bias")?;
-            let mctx = f32s(g_ref, "markov_ctx_mix.weight")?;
-            ensure!(mctx.len() == 4, "markov_ctx_mix.weight len {} != 4", mctx.len());
-            // The committed-context norm is `token_embd_norm` in this export.
-            let dnorm = f32s(g_ref, "token_embd_norm.weight")?;
-            // `hidden_out` is unused on this path; an empty Mat keeps the field honest instead of aliasing another
-            // tensor (a stray read would see a zero-length slice and panic rather than silently use wrong weights).
-            let none_mat = Mat { data: &[], ty: GgmlType::F32, rows: 0, cols: 0, cpu: true, gpu: None, scale: 1.0 };
-            (Vec::new(), Some(mctx), Some(w2), Some(w2b), none_mat, Vec::new(), dnorm)
-        } else {
+        let fuse = if g_ref.tensors.contains_key("dspark_fuse.weight") {
             let f = f32s(g_ref, "dspark_fuse.weight")?;
             ensure!(f.len() == 4 * (n_layer + 1), "dspark_fuse.weight len {} != {}", f.len(), 4 * (n_layer + 1));
-            (f, None, None, None, host_mat(g_ref, "dspark_hidden_out.weight")?, f32s(g_ref, "dspark_hidden_out.bias")?, f32s(g_ref, "dspark_norm.weight")?)
+            f
+        } else {
+            let mut f = Vec::with_capacity(4 * (n_layer + 1));
+            for il in 0..n_layer {
+                let row = f32s(g_ref, &format!("blk.{il}.ctx_mix.weight"))?;
+                ensure!(row.len() == 4, "blk.{il}.ctx_mix.weight len {} != 4", row.len());
+                f.extend_from_slice(&row);
+            }
+            let row = f32s(g_ref, "markov_ctx_mix.weight")?;
+            ensure!(row.len() == 4, "markov_ctx_mix.weight len {} != 4", row.len());
+            f.extend_from_slice(&row);
+            f
+        };
+        let dspark_norm = if g_ref.tensors.contains_key("dspark_norm.weight") {
+            f32s(g_ref, "dspark_norm.weight")?
+        } else {
+            f32s(g_ref, "markov_ctx_norm.weight")?
+        };
+        let token_embd_norm = if g_ref.tensors.contains_key("token_embd_norm.weight") {
+            Some(f32s(g_ref, "token_embd_norm.weight")?)
+        } else {
+            None
         };
         let mask_embd = f32s(g_ref, "mask_embd.weight")?;
         let output_norm = f32s(g_ref, "output_norm.weight")?;
         let joint_proj = host_mat(g_ref, "joint_proj.weight")?;
         let joint_proj_b = f32s(g_ref, "joint_proj.bias")?;
+        let markov_head = if g_ref.tensors.contains_key("markov_w2.weight") {
+            MarkovHead::Logits {
+                w2: host_mat(g_ref, "markov_w2.weight")?,
+                bias: f32s(g_ref, "markov_w2.bias")?,
+                gpu: std::sync::OnceLock::new(),
+            }
+        } else {
+            MarkovHead::HiddenOut {
+                weight: host_mat(g_ref, "dspark_hidden_out.weight")?,
+                bias: f32s(g_ref, "dspark_hidden_out.bias")?,
+            }
+        };
 
         let mut layers = Vec::with_capacity(n_layer);
         for il in 0..n_layer {
             let p = |s: &str| format!("blk.{il}.{s}");
             let m = |s: &str| Mat::load(g_ref, &p(s));
             let v = |s: &str| f32s(g_ref, &p(s));
+            let dflare_norm = if g_ref.tensors.contains_key(&p("dflare_norm.weight")) {
+                v("dflare_norm.weight")?
+            } else {
+                v("ctx_norm.weight")?
+            };
             layers.push(DsparkLayer {
                 swa: swa[il],
-                // The newer export names this `ctx_norm`; it normalizes the fused target features for the layer.
-                dflare_norm: v(if g_ref.tensors.contains_key(&p("ctx_norm.weight")) { "ctx_norm.weight" } else { "dflare_norm.weight" })?,
-                ctx_mix: g_ref.tensors.contains_key(&p("ctx_mix.weight")).then(|| v("ctx_mix.weight")).transpose()?,
+                dflare_norm,
                 attn_k_ctx: m("attn_k_ctx.weight")?,
                 attn_v_ctx: m("attn_v_ctx.weight")?,
                 attn_k_ctx_norm: v("attn_k_ctx_norm.weight")?,
@@ -186,9 +208,6 @@ impl DsparkDrafter {
         }
 
         Ok(Self {
-            markov_w2,
-            markov_w2_b,
-            markov_ctx_mix,
             n_layer,
             n_embd,
             n_head,
@@ -203,13 +222,13 @@ impl DsparkDrafter {
             target_layers,
             fuse,
             dspark_norm,
+            token_embd_norm,
             mask_embd,
             output_norm,
             markov_w1,
             joint_proj,
             joint_proj_b,
-            hidden_out,
-            hidden_out_b,
+            markov_head,
             layers,
             k_cache: vec![Vec::new(); n_layer],
             v_cache: vec![Vec::new(); n_layer],
@@ -239,11 +258,7 @@ impl DsparkDrafter {
     /// and RMS-normalize each token with `norm_w`.
     fn mix_features(&self, keep: usize, nt: usize, target_feats: &[f32], row: usize, norm_w: &[f32]) -> Vec<f32> {
         let n = self.n_embd;
-        // The newer export carries one 4-vector per layer (`ctx_mix`), the older a shared matrix indexed by `row`.
-        let mut w = match &self.markov_ctx_mix {
-            Some(_) => self.layers.get(row).and_then(|l| l.ctx_mix.clone()).unwrap_or_else(|| vec![0.25; 4]),
-            None => self.fuse[row * 4..(row + 1) * 4].to_vec(),
-        };
+        let mut w = self.fuse[row * 4..(row + 1) * 4].to_vec();
         crate::ops::softmax(&mut w);
         let mut out = vec![0.0f32; keep * n];
         out.par_chunks_mut(n).enumerate().for_each(|(t, dst)| {
@@ -305,13 +320,17 @@ impl DsparkDrafter {
 
         // 1. Build 8-token input: slot 0 is normed target token embedding of `anchor_tok`, slots 1..8 are `mask_embd`.
         let mut inp = vec![0.0f32; bs * n];
-        target.embed_normed(anchor_tok, &mut inp[..n]);
-        // The newer export stores one mask per drafted position ([n_embd, block_size - 1]); the older one a single
-        // vector reused for every slot.
-        let n_mask = if self.mask_embd.len() >= n * (bs - 1) { self.mask_embd.len() / n } else { 1 };
+        if let Some(norm_w) = &self.token_embd_norm {
+            let mut emb = vec![0.0f32; n];
+            target.embed_raw(anchor_tok, &mut emb);
+            rms_norm_w(&emb, norm_w, self.eps, &mut inp[..n]);
+        } else {
+            target.embed_normed(anchor_tok, &mut inp[..n]);
+        }
+        let per_pos_mask = self.mask_embd.len() >= (bs - 1) * n;
         for i in 1..bs {
-            let m = (i - 1).min(n_mask - 1);
-            inp[i * n..(i + 1) * n].copy_from_slice(&self.mask_embd[m * n..(m + 1) * n]);
+            let src = if per_pos_mask { &self.mask_embd[(i - 1) * n..i * n] } else { &self.mask_embd[..n] };
+            inp[i * n..(i + 1) * n].copy_from_slice(src);
         }
 
         // 2. Run the 3 non-causal DSpark transformer layers over the 8-token block.
@@ -411,48 +430,98 @@ impl DsparkDrafter {
         joint_in[2 * r + n..].copy_from_slice(ctx_feat);
         let mut joint = vec![0.0f32; 3 * r];
         let mut latent = vec![0.0f32; r];
-        let mut corr = vec![0.0f32; n];
         let mut prev = anchor_tok;
         let mut drafts = Vec::with_capacity(count);
 
-        for step in 0..count {
-            let h_row = &hidden[(step + 1) * n..(step + 2) * n];
-            self.markov_w1.row_into(prev as usize, &mut prev_embd);
-            joint_in[..r].copy_from_slice(&state);
-            joint_in[r..2 * r].copy_from_slice(&prev_embd);
+        let markov_step = |prev_tok: u32,
+                           h_row: &[f32],
+                           state: &mut [f32],
+                           prev_embd: &mut [f32],
+                           joint_in: &mut [f32],
+                           joint: &mut [f32],
+                           latent: &mut [f32]| {
+            self.markov_w1.row_into(prev_tok as usize, prev_embd);
+            joint_in[..r].copy_from_slice(state);
+            joint_in[r..2 * r].copy_from_slice(prev_embd);
             joint_in[2 * r..2 * r + n].copy_from_slice(h_row);
-
-            self.joint_proj.matvec(&joint_in, &mut joint);
+            self.joint_proj.matvec(joint_in, joint);
             for (v, &b) in joint.iter_mut().zip(&self.joint_proj_b) { *v += b; }
-
             for k in 0..r {
                 let gate = crate::ops::sigmoid(joint[k]);
                 let cand = joint[r + k].tanh();
                 state[k] = cand + gate * (state[k] - cand);
                 latent[k] = joint[2 * r + k].tanh();
             }
+        };
 
-            // The two exports predict differently: the old one runs the Markov latent through `dspark_hidden_out`
-            // into the target's LM head; the new one turns the latent into a per-vocabulary bias (`markov_w2`) added
-            // to the target's own logits of this position, which is what llama.cpp's build_dspark_markov_head does.
-            prev = if let Some(w2) = &self.markov_w2 {
-                let mut bias = vec![0.0f32; w2.rows];
-                w2.matvec(&latent, &mut bias);
-                if let Some(b) = &self.markov_w2_b {
-                    for (v, &bb) in bias.iter_mut().zip(b) { *v += bb; }
+        match &self.markov_head {
+            MarkovHead::HiddenOut { weight, bias } => {
+                let mut corr = vec![0.0f32; n];
+                for step in 0..count {
+                    let h_row = &hidden[(step + 1) * n..(step + 2) * n];
+                    markov_step(prev, h_row, &mut state, &mut prev_embd, &mut joint_in, &mut joint, &mut latent);
+                    weight.matvec(&latent, &mut corr);
+                    for ((c, &b), &h_v) in corr.iter_mut().zip(bias).zip(h_row) {
+                        *c = *c + b + h_v;
+                    }
+                    prev = target.lm_head_argmax(&corr);
+                    drafts.push(prev);
                 }
-                let mut logits = target.lm_head_logits(h_row);
-                let nv = logits.len().min(bias.len());
-                for i in 0..nv { logits[i] += bias[i]; }
-                crate::ops::argmax(&logits) as u32
-            } else {
-                self.hidden_out.matvec(&latent, &mut corr);
-                for ((c, &b), &h_v) in corr.iter_mut().zip(&self.hidden_out_b).zip(h_row) {
-                    *c = *c + b + h_v;
+            }
+            MarkovHead::Logits { w2, bias, gpu } => {
+                let gpu_w2 = gpu.get_or_init(|| {
+                    if w2.rows > target.output_rows() || w2.cols > n {
+                        return None;
+                    }
+                    let dm = crate::deepseek::mat::dev::get()?;
+                    let d = dm.lock().ok()?;
+                    let be = &*d.parts[0].be;
+                    let w2_gpu = be.upload(&crate::weights::Tensor {
+                        ty: w2.ty,
+                        rows: w2.rows,
+                        cols: w2.cols,
+                        data: w2.data,
+                        scale: w2.scale,
+                    }).ok()?;
+                    let bias_buf = be.alloc(bias.len() * 4).ok()?;
+                    be.put(bias, &bias_buf, 0).ok()?;
+                    Some(MarkovW2Gpu { w2: w2_gpu, bias: bias_buf })
+                });
+                let mut use_gpu = gpu_w2.is_some()
+                    && target.lm_head_batch_gpu(&hidden[n..(1 + count) * n], count);
+                let mut cpu_base: Option<Vec<f32>> = None;
+                let mut delta = Vec::new();
+                let n_vocab = target.cfg.n_vocab;
+                let nv = n_vocab.min(w2.rows).min(bias.len());
+
+                for step in 0..count {
+                    let h_row = &hidden[(step + 1) * n..(step + 2) * n];
+                    markov_step(prev, h_row, &mut state, &mut prev_embd, &mut joint_in, &mut joint, &mut latent);
+                    if use_gpu {
+                        let g = gpu_w2.as_ref().unwrap();
+                        if let Some(id) = target.markov_w2_argmax_gpu(&g.w2, g.bias.addr(), bias.len(), &latent, step) {
+                            prev = id;
+                            drafts.push(prev);
+                            continue;
+                        }
+                        use_gpu = false;
+                    }
+                    let base_all = cpu_base.get_or_insert_with(|| target.lm_head_batch_cpu(&hidden[n..(1 + count) * n], count));
+                    if delta.is_empty() { delta.resize(w2.rows, 0.0); }
+                    w2.matvec(&latent, &mut delta);
+                    let base = &base_all[step * n_vocab..(step + 1) * n_vocab];
+                    let (mut best_i, mut best_v) = (0usize, f32::NEG_INFINITY);
+                    for i in 0..nv {
+                        let v = base[i] + delta[i] + bias[i];
+                        if v > best_v {
+                            best_v = v;
+                            best_i = i;
+                        }
+                    }
+                    prev = best_i as u32;
+                    drafts.push(prev);
                 }
-                target.lm_head_argmax(&corr)
-            };
-            drafts.push(prev);
+            }
         }
         drafts
     }

@@ -676,18 +676,6 @@ impl Device {
     /// and return the argmax token ID (`0..c.n_vocab`). No softcap: `softcap * tanh(x / softcap)` keeps the
     /// order of the logits (two that differ by a few ulp may become equal), and the token is a draft that
     /// the target checks.
-    /// The target LM head's logits of `h` on the device: the same `gemvq` as `lm_head_argmax`, but the `n_vocab`
-    /// values are read back instead of reduced to one id (the DSpark export with `markov_w2` adds a per-vocabulary
-    /// bias to them, so a draft needs the vector; doing that on the host would read the whole 2.3 GB head per token).
-    pub(super) fn lm_head_logits(&self, m: &Inkling2Model, h_corr: &[f32]) -> Result<Vec<f32>> {
-        let c = &m.cfg;
-        let (s, o) = (self.s, self.scr.addr());
-        let d = dev::get().unwrap().lock().unwrap();
-        let be = &*d.parts[0].be;
-        be.put(h_corr, &self.scr, ((s.hn - o) / 4) as usize)?;
-        be.gemvq(d.tensor(m.output.gpu.unwrap()), s.hn, c.n_embd, 0, s.logits, c.n_vocab, 1)?;
-        be.get(&self.scr, ((s.logits - o) / 4) as usize, c.n_vocab)
-    }
 
     pub(super) fn lm_head_argmax(&self, m: &Inkling2Model, h_corr: &[f32]) -> Result<u32> {
         let c = &m.cfg;
@@ -699,6 +687,62 @@ impl Device {
         be.argmax_rows(s.logits, c.n_vocab, 1, s.amax)?;
         let id = be.get::<i32>(&self.scr, ((s.amax - o) / 4) as usize, 1)?[0] as u32;
         Ok(id)
+    }
+
+    /// Project `nt` hidden vectors (`[nt, n_embd]`) through the target's LM head on GPU into `pf.logits_buf`
+    /// (`[nt, m.output.rows]`), keeping the logits on device for `markov_w2_argmax_gpu`.
+    pub(super) fn lm_head_batch_gpu(&mut self, m: &Inkling2Model, h_rows: &[f32], nt: usize) -> Result<()> {
+        let c = &m.cfg;
+        let vrows = m.output.rows;
+        let d = dev::get().context("no GPU device")?.lock().map_err(|_| anyhow::anyhow!("GPU device lock poisoned"))?;
+        let be = &*d.parts[0].be;
+        self.ensure_pf(be, c, vrows, nt)?;
+        let pf = self.pf.as_ref().unwrap();
+        let o = pf.buf.addr();
+        be.put(h_rows, &pf.buf, ((pf.p.hn - o) / 4) as usize)?;
+        be.gemvq(d.tensor(m.output.gpu.context("output.weight not on GPU")?), pf.p.hn, c.n_embd, 0, pf.logits_buf.addr(), vrows, nt)?;
+        Ok(())
+    }
+
+    /// Add low-rank `w2 @ latent + bias` onto `pf.logits_buf[step]` on GPU and return the argmax token ID.
+    pub(super) fn markov_w2_argmax_gpu(
+        &self, m: &Inkling2Model, w2: &crate::backend::GpuTensor, bias_addr: u64, bias_len: usize, latent: &[f32], step: usize,
+    ) -> Result<u32> {
+        let c = &m.cfg;
+        let vrows = m.output.rows;
+        let nv = c.n_vocab.min(w2.rows).min(bias_len);
+        ensure!(nv > 0, "markov_w2: empty vocabulary intersection");
+        let pf = self.pf.as_ref().context("lm_head_batch_gpu not called")?;
+        let (s, o) = (self.s, self.scr.addr());
+        let d = dev::get().context("no GPU device")?.lock().map_err(|_| anyhow::anyhow!("GPU device lock poisoned"))?;
+        let be = &*d.parts[0].be;
+        be.put(latent, &self.scr, ((s.hn - o) / 4) as usize)?;
+        be.gemvq(w2, s.hn, w2.cols, 0, s.logits, w2.rows, 1)?;
+        be.add(s.logits, pf.logits_buf.addr() + (step * vrows * 4) as u64, nv)?;
+        be.add(s.logits, bias_addr, nv)?;
+        be.argmax_rows(s.logits, nv, 1, s.amax)?;
+        let id = be.get::<i32>(&self.scr, ((s.amax - o) / 4) as usize, 1)?[0] as u32;
+        Ok(id)
+    }
+
+    /// Project `nt` hidden vectors (`[nt, n_embd]`) through the target's LM head on GPU in one batched matvec
+    /// and return `[nt, c.n_vocab]` logits (before softcap).
+    pub(super) fn lm_head_batch(&mut self, m: &Inkling2Model, h_rows: &[f32], nt: usize) -> Result<Vec<f32>> {
+        let c = &m.cfg;
+        let vrows = m.output.rows;
+        self.lm_head_batch_gpu(m, h_rows, nt)?;
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        let pf = self.pf.as_ref().unwrap();
+        let raw = be.get::<f32>(&pf.logits_buf, 0, nt * vrows)?;
+        if vrows == c.n_vocab {
+            return Ok(raw);
+        }
+        let mut out = Vec::with_capacity(nt * c.n_vocab);
+        for row in raw.chunks_exact(vrows) {
+            out.extend_from_slice(&row[..c.n_vocab]);
+        }
+        Ok(out)
     }
 
     fn record_dspark_visit(&self, visit: usize, cur_a: u64, nt: usize, n: usize) -> Result<()> {
