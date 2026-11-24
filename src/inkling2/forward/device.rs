@@ -676,6 +676,19 @@ impl Device {
     /// and return the argmax token ID (`0..c.n_vocab`). No softcap: `softcap * tanh(x / softcap)` keeps the
     /// order of the logits (two that differ by a few ulp may become equal), and the token is a draft that
     /// the target checks.
+    /// The target LM head's logits of `h` on the device: the same `gemvq` as `lm_head_argmax`, but the `n_vocab`
+    /// values are read back instead of reduced to one id (the DSpark export with `markov_w2` adds a per-vocabulary
+    /// bias to them, so a draft needs the vector; doing that on the host would read the whole 2.3 GB head per token).
+    pub(super) fn lm_head_logits(&self, m: &Inkling2Model, h_corr: &[f32]) -> Result<Vec<f32>> {
+        let c = &m.cfg;
+        let (s, o) = (self.s, self.scr.addr());
+        let d = dev::get().unwrap().lock().unwrap();
+        let be = &*d.parts[0].be;
+        be.put(h_corr, &self.scr, ((s.hn - o) / 4) as usize)?;
+        be.gemvq(d.tensor(m.output.gpu.unwrap()), s.hn, c.n_embd, 0, s.logits, c.n_vocab, 1)?;
+        be.get(&self.scr, ((s.logits - o) / 4) as usize, c.n_vocab)
+    }
+
     pub(super) fn lm_head_argmax(&self, m: &Inkling2Model, h_corr: &[f32]) -> Result<u32> {
         let c = &m.cfg;
         let (s, o) = (self.s, self.scr.addr());

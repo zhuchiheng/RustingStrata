@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub mod preflight;
 pub mod spv_smem;
 
+/// Flushes seen so far, for STRATA_VK_PROF_EVERY (bench exits without dropping the Inner, so Inner::drop never prints
+/// the profile; this lets a run report it periodically instead).
+static PROF_FLUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
 /// Staged copies are submitted once this many bytes are queued: a submit per expert matrix costs more than the copy.
@@ -221,7 +224,7 @@ struct State {
     busy: bool,
     /// Graph command buffers, kept for the backend's life.
     gpool: vk::CommandPool,
-    graphs: HashMap<u64, vk::CommandBuffer>,
+    graphs: HashMap<u64, (vk::CommandBuffer, Vec<&'static str>)>,
     /// The graph being recorded; ops go there instead of `cur`.
     rec: Option<vk::CommandBuffer>,
     /// Inside `batch`: dispatches get no barrier after them (except quant_xq, read by the GEMV after it). quant_xq
@@ -738,6 +741,22 @@ impl Inner {
                     }
                 }
             } }
+            if let Ok(n) = std::env::var("STRATA_VK_PROF_EVERY") {
+                let n: u64 = n.parse().unwrap_or(0);
+                let seen = PROF_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n > 0 && seen % n == 0 {
+                    if let Some((_, _, tot)) = &st.prof { if !tot.is_empty() {
+                        let scale = self.ts_period as f64;
+                        let mut v: Vec<_> = tot.iter().collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+                        let all: f64 = v.iter().filter(|(k, _)| **k != "_barrier_gap").map(|x| x.1.0 as f64 * scale).sum();
+                        eprintln!("vulkan prof flush {seen} (period {:.2} ns, kernel sum {:.2} ms):", self.ts_period, all / 1e6);
+                        for (nm, (ticks, c)) in v {
+                            let ns = *ticks as f64 * scale;
+                            eprintln!("prof {nm:24} {:9.2} ms {:5.1}% {c:7} calls {:8.2} us", ns / 1e6, ns * 100.0 / all.max(1.0), ns / 1e3 / (*c).max(1) as f64);
+                        }
+                    } }
+                }
+            }
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
@@ -891,16 +910,17 @@ impl Vk {
         let p = self.0.pipeline(&mut st, name, spec)?;
         let cb = self.0.cb(&mut st)?;
         let d = &self.0.dev;
+        let prof_graph = std::env::var_os("STRATA_VK_PROF_GRAPH").is_some();
         unsafe {
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p);
             d.cmd_push_constants(cb, self.0.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
+            if st.rec.is_none() || prof_graph { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
                 if names.is_empty() { d.cmd_reset_query_pool(cb, *qp, 0, 65536); }
                 d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32); } } }
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
-        if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
+        if st.rec.is_none() || prof_graph { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
             let label = match (name, spec.get(1).copied()) {
                 ("gemv_q", Some(11)) => "gemv_q:Q3_K",
                 ("gemv_q", Some(13)) => "gemv_q:Q5_K",
@@ -1208,7 +1228,10 @@ impl Backend for Vk {
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
         let mut st = self.0.st();
-        if let Some(&g) = st.graphs.get(&key) { return self.0.enqueue_cb(&mut st, Some(g)); }
+        if let Some((g, names)) = st.graphs.get(&key).cloned() {
+            if let Some((_, live, _)) = &mut st.prof { if live.is_empty() { *live = names; } }
+            return self.0.enqueue_cb(&mut st, Some(g));
+        }
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { drop(st); return f(); }
         let c = unsafe { self.0.dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(st.gpool)
             .command_buffer_count(1)) }?[0];
@@ -1223,12 +1246,13 @@ impl Backend for Vk {
         self.0.end_cond(&mut st, c);
         unsafe { self.0.dev.end_command_buffer(c) }?;
         if let Err(e) = r { unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) }; return Err(e); }
-        st.graphs.insert(key, c);
+        let rec_names = st.prof.as_ref().map(|(_, n, _)| n.clone()).unwrap_or_default();
+        st.graphs.insert(key, (c, rec_names));
         self.0.enqueue_cb(&mut st, Some(c))
     }
     fn graph_drop(&self, key: u64) -> anyhow::Result<()> {
         let mut st = self.0.st();
-        let Some(c) = st.graphs.remove(&key) else { return Ok(()) };
+        let Some((c, _)) = st.graphs.remove(&key) else { return Ok(()) };
         // The buffer may still be queued or running.
         self.0.flush(&mut st)?;
         unsafe { self.0.dev.free_command_buffers(st.gpool, &[c]) };

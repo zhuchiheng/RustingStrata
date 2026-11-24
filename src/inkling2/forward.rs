@@ -584,6 +584,21 @@ impl<'a> Inkling2Model<'a> {
         crate::ops::argmax(&logits) as u32
     }
 
+    /// The target LM head's logits of `h` (`[n_embd]`), `n_vocab` of them, before the softcap. The current DSpark
+    /// export (`dflash.has_markov_context = 1`) adds a per-vocabulary bias from `markov_w2` to these, so a draft needs
+    /// the logits rather than only their argmax.
+    pub fn lm_head_logits(&self, h: &[f32]) -> Vec<f32> {
+        if let Some(d) = &self.device
+            && let Ok(v) = d.lm_head_logits(self, h)
+        {
+            return v;
+        }
+        let mut logits = vec![0.0f32; self.output.rows];
+        self.output.matvec(h, &mut logits);
+        logits.truncate(self.cfg.n_vocab);
+        logits
+    }
+
     /// Add the time since `t` to part `i` of the profile; returns the time now.
     fn lap(&self, i: usize, t: std::time::Instant) -> std::time::Instant {
         self.prof[i].set(self.prof[i].get() + t.elapsed().as_secs_f64());
