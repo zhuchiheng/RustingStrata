@@ -13,17 +13,17 @@ use std::sync::Arc;
 
 mod nvrtc;
 
-const QTYPES: [GgmlType; 29] = {
+pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-const KERNELS: [&str; 54] = [
+pub(crate) const KERNELS: [&str; 58] = [
     "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
     "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
     "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
-    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_ffn_sum", "ink_route",
+    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
@@ -85,7 +85,7 @@ const GEMMD_SLOT: usize = GEMMD_SPLIT_ROWS / 128 * 4 + 2 * 64 * GEMMD_SPLIT_ROWS
 /// bound (cudarc leaves `CudaGraph` without `Send` only because it holds raw pointers).
 struct Graph(CudaGraph);
 
-const AMAX_PARTS: usize = 64;
+pub(crate) const AMAX_PARTS: usize = 64;
 unsafe impl Send for Graph {}
 
 /// `--llama-numerics`: quantize activations like llama.cpp's CPU q8_K (one scale per 256) for every integer matmul,
@@ -115,11 +115,11 @@ pub fn gemm_fma() -> bool { std::env::var_os("STRATA_GEMM_FMA").is_some() }
 /// Prefill attention query / key tile sizes in positions. `FA_BQ` is one warp's 16 query rows times the four warps
 /// of the 128-thread block; `FA_BK` is the K/V tile depth and must stay a multiple of 32 for the sm_70 `m8n8k4`
 /// and sm_80+ `m16n8k16` fragment loops. Injected into kernels.cu by `source()`, never edited there.
-const FA_BQ: usize = 64;
-const FA_BK: usize = 32;
+pub(crate) const FA_BQ: usize = 64;
+pub(crate) const FA_BK: usize = 32;
 /// Prefill GEMM K tile in halves (default, candidate C3 overrides it with `STRATA_GEMM_BK=32`). `GEMM_BM` lives in
 /// `backend.rs` because the prefill tile-list builder shares it with Vulkan.
-const GEMM_BK: usize = 64;
+pub(crate) const GEMM_BK: usize = 64;
 /// Row padding of the attention shared-memory tiles (`PQ = HD + 8`, `FA_BK + 8` in `attn_prefill_t`).
 const ATTN_SMEM_PAD: usize = 8;
 
@@ -153,13 +153,13 @@ impl Tune {
 }
 
 /// `default` unless `v` parses to a value accepted by `valid`.
-fn tuned(v: Option<&str>, default: usize, valid: impl Fn(usize) -> bool) -> usize {
+pub(crate) fn tuned(v: Option<&str>, default: usize, valid: impl Fn(usize) -> bool) -> usize {
     v.and_then(|s| s.trim().parse::<usize>().ok()).filter(|&x| valid(x)).unwrap_or(default)
 }
 
 /// Rows per warp: the family override (`STRATA_RPW_MOE`/`_DENSE`) first, then `STRATA_RPW`, then the shape default.
 /// 1..=64 keeps a block's row loop bounded; anything else falls back one level, as `tuned` does.
-fn rpw_from(global: Option<&str>, family: Option<&str>, default: usize) -> usize {
+pub(crate) fn rpw_from(global: Option<&str>, family: Option<&str>, default: usize) -> usize {
     let ok = |v: usize| (1..=64).contains(&v);
     family.and_then(|s| s.trim().parse().ok()).filter(|&v| ok(v))
         .or_else(|| global.and_then(|s| s.trim().parse().ok()).filter(|&v| ok(v)))
@@ -168,7 +168,7 @@ fn rpw_from(global: Option<&str>, family: Option<&str>, default: usize) -> usize
 
 /// Threads per block of the integer GEMV: the family override first, then the global value, then 256. Only the
 /// three warp counts the kernel's row mapping can tile are accepted (4/8/16 warps per block).
-fn gemv_block_from(global: Option<&str>, family: Option<&str>) -> u32 {
+pub(crate) fn gemv_block_from(global: Option<&str>, family: Option<&str>) -> u32 {
     let ok = |v: u32| matches!(v, 128 | 256 | 512);
     family.and_then(|s| s.trim().parse::<u32>().ok()).filter(|&v| ok(v))
         .or_else(|| global.and_then(|s| s.trim().parse::<u32>().ok()).filter(|&v| ok(v)))
@@ -220,7 +220,7 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
 fn attn_prefill_smem(hd: usize) -> usize { attn_prefill_smem_bk(hd, FA_BK) }
 
 /// `attn_prefill_smem` for a K/V tile depth of `bk` keys (16 on Turing at head_dim 256, else `FA_BK`).
-fn attn_prefill_smem_bk(hd: usize, bk: usize) -> usize {
+pub(crate) fn attn_prefill_smem_bk(hd: usize, bk: usize) -> usize {
     let pq = hd + ATTN_SMEM_PAD;
     2 * (FA_BQ + 2 * bk) * pq + 2 * FA_BQ * (bk + ATTN_SMEM_PAD)
 }
@@ -268,7 +268,7 @@ fn int8_gemm_arch(cc: (i32, i32)) -> bool { cc.0 >= 8 }
 /// decode GQA kernels (8 query slices per head group plus the cp.async K/V chunks at head_dim 128/256, `attn`),
 /// `usize::MAX` for `gemvn_*` whose request depends on the tensor shape (`xq_smem * nt`, `gemv_cfg`), and `None`
 /// for every kernel that never asks for more than the 48 KiB default (`attn_decode_*`, `attn_merge`, the rest).
-fn dyn_shmem_need(name: &str) -> Option<(&'static str, usize)> {
+pub(crate) fn dyn_shmem_need(name: &str) -> Option<(&'static str, usize)> {
     let family = if name.starts_with("attn_prefill") { "attn_prefill_*" }
         else if name.starts_with("attn_decode_gqa") { "attn_decode_gqa*" }
         else if name.starts_with("gemvn") { "gemvn_*" }
@@ -367,7 +367,7 @@ fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveou
 /// The kernel names to load from the cubin: the full list on sm_80+, without the int8 GEMM (`gemmi_*`, `gemmis_*` and
 /// `gemmd_*`, 23 non-float types x 3 fewer names) on a device where that code is not compiled in. Pure so a CPU test can pin
 /// both lists (393 / 324 names).
-fn kernel_names(sm80: bool) -> Vec<String> {
+pub(crate) fn kernel_names(sm80: bool) -> Vec<String> {
     let int8 = move |&&t: &&GgmlType| sm80 && !t.float_x();
     KERNELS.iter().map(|s| s.to_string())
         .chain(QTYPES.iter().flat_map(|&t| ["dequant", "gemv", "gemvn", "moe_gemv", "gemm", "gemms"].map(|p| kname(p, t))))
@@ -452,7 +452,7 @@ macro_rules! launch {
     }};
 }
 
-fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
+pub(crate) fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
 
 /// The UUID of every CUDA device in CUDA's order, the order `Gpu::new` counts in: `None` for a device the driver
 /// gives none for, empty when CUDA does not load. No context is created. NVIDIA's Vulkan driver reports the same 16
@@ -1167,15 +1167,20 @@ impl Backend for Gpu {
         &self, q: u64, r: u64, sink: u64, gate: u64, kc: u64, vc: u64, kc_new: u64, vc_new: u64, bias: u64, out: u64,
         pos: usize, nt: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize, ring: usize, win: usize,
     ) -> anyhow::Result<()> {
-        let kn = match hd {
-            32 => "ink_attn_prefill_32",
-            64 => "ink_attn_prefill_64",
-            128 => "ink_attn_prefill_128",
-            _ => anyhow::bail!("ink_attn_prefill: unsupported hd={hd}"),
-        };
-        launch!(self, kn, cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
-            q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
-            pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        anyhow::ensure!(matches!(hd, 32 | 64 | 128), "ink_attn_prefill: unsupported hd={hd}");
+        let g = nh / nkv.max(1);
+        if win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
+            // Every key: a block is one K/V head and `tb` tokens, with 32 keys of K and V in shared memory.
+            let tb = (32 / g).min(8);
+            launch!(self, &format!("ink_attn_prefill_sh_{hd}"), cfg((nt.div_ceil(tb) as u32, nkv as u32), (32 * tb * g) as u32, (2 * 32 * hd * 4) as u32),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, i32::MAX, win as i32);
+        } else {
+            // `ring` is the count of old rows that the kernel wraps at: only a sliding layer wraps.
+            launch!(self, &format!("ink_attn_prefill_{hd}"), cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, if win > 0 { ring.max(1) } else { i32::MAX as usize } as i32, win as i32);
+        }
         Ok(())
     }
     fn ink_ffn_sum_n(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, nt: usize, cpu: u64) -> anyhow::Result<()> {
@@ -1235,6 +1240,14 @@ impl Backend for Gpu {
         let smem = attn_prefill_smem_bk(hd, bk) as u32;
         launch!(self, &format!("attn_prefill_{hd}"), cfg((t.div_ceil(64) as u32, nh as u32), 128, smem),
             q, kc, vc, qg, out, step, t as i32, nh as i32, nkv as i32, scale, qm, mw as i32, sink, win as i32);
+        Ok(())
+    }
+
+    fn attn_sel(&self, q: u64, kc: u64, vc: u64, idx: u64, cnt: u64, out: u64, nt: usize, nh: usize, nkv: usize, hd: usize, ns: usize, scale: f32) -> anyhow::Result<()> {
+        let per = nh / nkv.max(1);
+        anyhow::ensure!(hd % 32 == 0 && hd <= 256 && nkv > 0 && nh % nkv == 0 && per <= 32, "attn_sel: unsupported shape nh={nh} nkv={nkv} hd={hd}");
+        launch!(self, "attn_sel", cfg((nt as u32, nkv as u32), (per * 32) as u32, (((per + 64) * hd + per * 32 + 32) * 4) as u32),
+            q, kc, vc, idx, cnt, out, nh as i32, nkv as i32, hd as i32, ns as i32, scale);
         Ok(())
     }
 
@@ -1522,12 +1535,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 393 names today (sm_80); 23 non-float types x 3 fewer names = 324 on sm_70.
+    /// them out. 397 names today (sm_80); 23 non-float types x 3 fewer names = 328 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 393);
-        assert_eq!(sm70.len(), 324);
+        assert_eq!(sm80.len(), 397);
+        assert_eq!(sm70.len(), 328);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());

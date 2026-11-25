@@ -168,6 +168,10 @@ fn up<T: crate::backend::Plain>(be: &dyn Backend, v: &[T]) -> Result<Buf> {
 
 fn f(floats: usize) -> u64 { 4 * floats as u64 }
 
+/// Rows of a K/V buffer that grows to hold `need`: a quarter more, so that a reply does not grow it at every token
+/// and a long prompt does not take twice its rows from the experts.
+fn grown(need: usize, max_ctx: usize) -> usize { (need + need / 4).next_multiple_of(1024).min(max_ctx) }
+
 /// Free expert slots until `need` bytes of VRAM are free.
 fn room(d: &mut dev::Dev, need: usize) {
     let free = d.parts[0].be.mem_info().map_or(0, |m| m.0);
@@ -400,21 +404,40 @@ impl Device {
         let row_words = d.parts[0].be.kv_words(kw);
         let full_cap = self.slots.iter().enumerate().find(|&(il, _)| !c.swa[layer_of(c, il)]).map(|(_, s)| s.cap);
         if let Some(cap) = full_cap && need > cap {
-            let mut new_cap = cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown(need, m.max_ctx);
             let n = (0..c.n_slot()).filter(|&il| !c.swa[layer_of(c, il)]).count();
-            room(&mut d, 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (128 << 20));
+            // The margin is the one of `new`: the prompt scratch and the graphs of the reply come after this.
+            let bytes = 4 * n * new_cap * row_words + sc_bytes(c, new_cap) + (512 << 20);
+            room(&mut d, bytes);
+            // The expert cache was not enough: whole layers of experts go, the last loaded first. Their experts
+            // then run through the expert cache or on the CPU, which costs less than a model without its device state.
+            let free = |d: &dev::Dev| d.parts[0].be.mem_info().map_or(0, |m| m.0);
+            if free(&d) < bytes {
+                d.parts[0].be.sync()?;
+                let order: Vec<usize> = (c.loop_start..c.loop_end).chain(0..c.loop_start).chain(c.loop_end..c.n_layer).collect();
+                // Counted here: the driver may report the freed bytes late.
+                let mut short = bytes - free(&d);
+                for &ip in order.iter().rev() {
+                    if short == 0 { break; }
+                    if let Some(fe) = self.layers[ip].full_exps.take() {
+                        // The budget falls too, so the expert cache does not take the room back.
+                        d.parts[0].budget = d.parts[0].budget.saturating_sub(fe.gu.len() + fe.dn.len());
+                        short = short.saturating_sub(fe.gu.len() + fe.dn.len());
+                        self.all_full = false;
+                    }
+                }
+            }
         }
         let be = &*d.parts[0].be;
-        let need_sc = sc_bytes(c, need);
+        // The score buffer follows the K/V rows: it is in the room made above, and a reply does not grow it every 64 tokens.
+        let need_sc = sc_bytes(c, full_cap.map_or(need, |cap| if need > cap { grown(need, m.max_ctx) } else { cap }));
         if self.sc_buf.len() < need_sc {
             be.sync()?;
             self.sc_buf = be.alloc(need_sc)?;
         }
         for (il, s) in self.slots.iter_mut().enumerate() {
             if c.swa[layer_of(c, il)] || need <= s.cap { continue; }
-            let mut new_cap = s.cap;
-            while new_cap < need { new_cap = (new_cap * 2).min(m.max_ctx); }
+            let new_cap = grown(need, m.max_ctx);
             for b in [&mut s.k, &mut s.v] {
                 let new = be.alloc(2 * new_cap * row_words)?;
                 be.dtod(b, 0, &new, 0, b.len())?;
@@ -458,7 +481,7 @@ impl Device {
     pub(super) fn to_host(&mut self, c: &Inkling2Config, layers: &[Layer], slots: &mut [Slot], pos: usize, max_ctx: usize) {
         if !self.ahead { return; }
         assert!(crate::cuda::kv_mode() == 0 || self.synced == pos,
-            "quantized KV cache (--kv q8/q4/q2) is only supported on the GPU path");
+            "the card has no room for the K/V cache, and a quantized KV cache (--kv q8/q4/q2) cannot move to the CPU: run with a smaller --ctx");
         let d = dev::get().unwrap().lock().unwrap();
         let be = &*d.parts[0].be;
         let (hd, (at, len)) = (c.head_dim, hists(c));
@@ -723,26 +746,6 @@ impl Device {
         be.argmax_rows(s.logits, nv, 1, s.amax)?;
         let id = be.get::<i32>(&self.scr, ((s.amax - o) / 4) as usize, 1)?[0] as u32;
         Ok(id)
-    }
-
-    /// Project `nt` hidden vectors (`[nt, n_embd]`) through the target's LM head on GPU in one batched matvec
-    /// and return `[nt, c.n_vocab]` logits (before softcap).
-    pub(super) fn lm_head_batch(&mut self, m: &Inkling2Model, h_rows: &[f32], nt: usize) -> Result<Vec<f32>> {
-        let c = &m.cfg;
-        let vrows = m.output.rows;
-        self.lm_head_batch_gpu(m, h_rows, nt)?;
-        let d = dev::get().unwrap().lock().unwrap();
-        let be = &*d.parts[0].be;
-        let pf = self.pf.as_ref().unwrap();
-        let raw = be.get::<f32>(&pf.logits_buf, 0, nt * vrows)?;
-        if vrows == c.n_vocab {
-            return Ok(raw);
-        }
-        let mut out = Vec::with_capacity(nt * c.n_vocab);
-        for row in raw.chunks_exact(vrows) {
-            out.extend_from_slice(&row[..c.n_vocab]);
-        }
-        Ok(out)
     }
 
     fn record_dspark_visit(&self, visit: usize, cur_a: u64, nt: usize, n: usize) -> Result<()> {
@@ -1451,13 +1454,15 @@ impl Device {
             let t = std::time::Instant::now();
             let list = Inkling2Model::resident(ml, c.n_expert, &on_gpu);
             let d = lock();
-            let (p, mut owned) = (&d.parts[0], vec![]);
+            let (p, mut staged) = (&d.parts[0], None);
             (|| -> Option<()> {
                 // One moe_gemv per matrix kind for all of them (8 small gemvs leave most of the card idle).
                 let Some((gu, dn, ..)) = list.first() else { return Some(()) };
                 let (k, gs) = (list.len(), list.iter().map(|e| e.3).collect::<Vec<f32>>());
-                let mut ptrs = |down: bool| list.iter().map(|e| d.weight(p, if down { &e.1 } else { &e.0 }, &mut owned).map(|t| t.ptr)).collect::<Option<Vec<u64>>>();
-                let (pg, pd) = (ptrs(false)?, ptrs(true)?);
+                let (gm, dm): (Vec<_>, Vec<_>) = list.iter().map(|e| (e.0, e.1)).unzip();
+                let (buf, ptrs) = d.weights(p, &[&gm, &dm])?;
+                let (pg, pd) = (ptrs[..k].to_vec(), ptrs[k..].to_vec());
+                staged = (buf.len() > 0).then_some(buf);
                 match (slab(&pg), slab(&pd)) {
                     (Some((bg, sg, ig)), Some((bd, sd, id))) => {
                         p.be.put(&[ig, id].concat(), &self.scr, ((s.ids - o) / 4) as usize).ok()?;
@@ -1483,7 +1488,7 @@ impl Device {
                 }
                 // Wait when an expert came from the file: its copy lives until the run ends, and the CPU share
                 // follows the time. With every expert in VRAM the queue runs on.
-                if adapt || !owned.is_empty() { p.be.sync().ok()?; }
+                if adapt || staged.is_some() { p.be.sync().ok()?; }
                 Some(())
             })()?;
             Some(t.elapsed().as_secs_f32())

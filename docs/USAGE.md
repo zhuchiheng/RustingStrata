@@ -5,9 +5,9 @@ Everything here applies to `rustingstrata chat`, `generate`, `bench` and `serve`
 
 ## Terminal
 
-`rustingstrata interface` is a short set of questions in the terminal: the model (a numbered list of the models
-folder and of the Hugging Face and llama.cpp caches; its last row takes a path to one file, or to a folder whose
-models it then lists), the mode (chat in the terminal,
+`rustingstrata interface` is a short set of questions in the terminal: the model (a numbered list of the last 10
+models picked here, the last one first, then the models folder and the Hugging Face and llama.cpp caches; its last
+row takes a path to one file, or to a folder whose models it then lists), the mode (chat in the terminal,
 chat page in the browser, API server, speed test), GPU or CPU, the context length and, for a server, the address.
 Enter takes the default in brackets. It prints the command the answers make and runs it, so the command can be
 copied for the next time. `--models-dir DIR` lists another folder.
@@ -71,7 +71,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 
 ## Flags
 
-- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
+- `--backend NAME` GPU backend: `cuda`, `vulkan` or `hip` (AMD cards through ROCm, one device per run, see [HIP.md](HIP.md)). Without it CUDA is used when it loads, else Vulkan.
+- `--ctx` KV cache size in tokens (default 4096). For Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 it is the prompt plus reply limit instead, and the default is the context the model was trained on; their caches grow with the text.
 - `--mtp [N]` speculative decoding with the model's draft head. Greedy tokens stay the same; sampling keeps its
   distribution. Needs a GGUF with an MTP head (for example the Qwen3.6-35B-A3B MTP files).
   Qwen3.8-Flash-Next (`qwen4exp`) takes its head from a companion file: `--mtp-model mtp-...-shared-Q8_0.gguf`.
@@ -111,8 +112,11 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   differently from one-token decoding, so greedy output can differ at a near tie.
 - `--chunk`, `--threads` prefill chunk size and CPU expert threads. On a GPU `--threads` defaults to the physical
   core count (SMT siblings only add contention; on the 6-core/12-thread reference machine 6 beats 12 by ~20%).
-  `rustingstrata calibrate` measures the best chunk and later runs read it from
-  `~/.cache/rusting_strata/strata-<model>.json` unless flags override.
+  `rustingstrata calibrate` measures the best chunk, draft count and short-prompt threshold and later runs read them
+  from `~/.cache/rusting_strata/strata-<model>[-backend][-dev…].json` unless flags override. The suffix uses the
+  backend that actually opened (so a CUDA to Vulkan fallback writes the Vulkan file). The models with their own
+  forward are calibrated too; see [CALIBRATION.md](CALIBRATION.md) for the budgeted search and the `calibrate spec`
+  sweep.
   `XDG_CACHE_HOME` moves that folder to `$XDG_CACHE_HOME/rusting_strata` (on Windows it is
   `%LOCALAPPDATA%\rusting_strata`). In a container, set it to a mounted path: `docker run --rm` otherwise discards
   the file on exit, and the next container runs uncalibrated. The file names the GPU it was measured on, and a file
@@ -135,9 +139,9 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   expert placement see the VRAM it takes, and picks the draft count. Runs with the same `--mtp-model` or
   `--draft-model` file use that count unless `--mtp` is given; runs with another draft file or none do not.
 - `calibrate --model ~/models` calibrates every model in a folder (and its subfolders, as the chat page lists them),
-  one after another, with the other flags applied to each. A model that fails is reported and the rest go on; Inkling
-  2, Hy4, GLM, DeepSeek and Gemma 4 models are skipped: `calibrate` measures the main engine only, and these models
-  run on their own code path, which reads no calibration file. `--mtp-model` and `--draft-model` need a single file.
+  one after another, with the other flags applied to each. A model that fails is reported and the rest go on. All
+  architectures are included: Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 are measured through their own `bench` path.
+  `--mtp-model` and `--draft-model` need a single model file.
 - `--thinking-budget N` (`chat` and `serve`) ends the thinking block after `N` tokens by inserting `</think>`,
   so the model goes on to the answer (0, the default, is no limit). A request overrides it with
   `thinking_budget` or `chat_template_kwargs.thinking_budget` (Anthropic: `thinking.budget_tokens`).
@@ -155,12 +159,12 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
 - `--alias prism` (`serve`) is the model name in `/v1/models` and in the replies, whatever file is loaded (default: the
   file name), so clients set up for `prism` keep working when another model is loaded. Calibration and the expert
   profile stay per file.
-- Inkling 2, Hy4, GLM, DeepSeek and Gemma 4 run on their own code path. The server loads them like any other model
+- Inkling 2, Hy4, GLM, DeepSeek, Kolibri and Gemma 4 run on their own code path. The server loads them like any other model
   (`serve --model <file>`, or from the chat page of a running server, in either direction), with these limits: one
   request at a time, greedy (Inkling 2 also samples: `temperature`, `top_k`, `top_p`, `seed`; a seed repeats its
   text only with `STRATA_FIXED_EXPERTS=1`, because the adaptive expert split moves the logits a little),
-  `/v1/chat/completions` only (no `/v1/messages`), and no calibration (`calibrate` does
-  not cover them). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
+  `/v1/chat/completions` only (no `/v1/messages`). `calibrate` measures their prefill chunk only
+  ([CALIBRATION.md](CALIBRATION.md)). The context limit is `--ctx` (or the page's context setting) when given, else the trained context.
 - `--lora PATH:SCALE` applies a LoRA adapter at runtime, see [LORA.md](LORA.md).
 - `--mcp FILE` (`serve` only, or `STRATA_MCP`) lists the MCP servers whose tools the chat page may call, see
   [Tools (MCP)](#tools-mcp).
@@ -176,6 +180,10 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `model` that no listed file has is answered by the loaded model. If the load fails, the request gets `503` with
   the reason and the next chat request loads the model that was there before. With API keys only the admin key sees
   the other models and switches; a customer key sees and gets the loaded model.
+- A streamed reply sends its response head when the model takes the request, before the prompt runs. While the prompt
+  runs, and while the text of a tool call is held back, the stream sends the SSE comment `: keep-alive` every 15 s, so
+  a client that stops after some minutes without a byte keeps reading. If the prompt fails after the head, the stream
+  ends early.
 - It runs one request at a time; `--parallel N` (GPU) decodes up to N together (4 requests: 164 tok/s in total on the
   RTX 3060, 41 each; see [HOSTING.md](HOSTING.md)). From 8 requests decoding at once (`STRATA_BATCH_MIN` sets the
   count), a dense model without MTP, LoRA or recurrent layers on CUDA runs them in one batched forward, and the
@@ -193,6 +201,8 @@ other MCP clients use, and pass it with `--mcp <file>` (or `STRATA_MCP`; the def
   `penalty_last_n` tokens of the reply (default 64; 0 turns it off, -1 takes the whole reply). The window is for
   the repeat penalty only: the presence and frequency penalties count the whole reply.
 - `max_tokens` (or `max_completion_tokens`) and `stop` (up to 16 strings) work as in the OpenAI API; `n` must be 1.
+  Without `max_tokens` (and without `--max-tokens` on the server) a reply runs until the model stops or the context
+  is full.
 - A request whose last message has role `assistant` (and no tool calls) continues that message: the reply holds only
   the new text. The chat page's continue button uses this.
 - Thinking is on by default (`--think false` turns it off). A request overrides it with `chat_template_kwargs.enable_thinking`
@@ -225,26 +235,19 @@ OpenCode and other agents use the OpenAI address.
 
 `--device 0,1` splits the layers over the cards in proportion to their free VRAM, so more experts stay resident. The
 cards run one after the other, so one request gets more memory, not twice the speed of one card. MTP drafting is off on
-a split model.
+a split model. The HIP backend runs one device, so `--device 0,1` is refused with `--backend hip`.
 
 An index is the same card on both backends. NVIDIA cards are counted as CUDA counts them (by default the fastest card
 first, which is not the order of `nvidia-smi`), on Vulkan too; the other Vulkan devices follow, dedicated cards before
 integrated ones. The load prints the card of every index (`cuda device 1: ...` or `vulkan device 1: ...`).
 
 The split by free VRAM does not know which card is faster or which sits on a slow PCIe link (x1 riser, x4 slot).
-`rustingstrata calibrate --model M.gguf --device 0,1` measures it: it times prefill and decode with the split by free
-VRAM, then with layers moved from one card to the other in steps of 15% of the layers, and follows the faster
-direction for up to three rounds. A split that is more than 3% faster (prefill tok/s times decode tok/s; each split line prints this product as
-a share of the best one so far) is written to the calibration file as layers per card, and later runs with the same
-cards in the same `--device` order load with it.
-A card with fewer layers keeps more of their experts in VRAM, so fewer are uploaded to it during prefill, and the other
-card then keeps fewer of its own: the timings decide. The order of the cards is not searched: to compare, calibrate
-`--device 1,0` too. Each order has its own file (`strata-<model>-dev0-1.json`, `-dev1-0.json`), and a run uses the
-file of the order it is given.
-
-`--split 30,70` (or `STRATA_SPLIT=30,70`) sets the share of the layers per card by hand, in `--device` order, and
-takes precedence over the calibrated split; `calibrate --split 30,70` measures chunk and drafts with that split and
-stores it. The load prints each card's layers and its measured host-to-VRAM copy rate. AMD cards clock down in the gaps while the other card works; `echo high >
+`--split 30,70` (or `STRATA_SPLIT=30,70`) sets the share of the layers per card by hand, in `--device` order; the load
+prints each card's layers and its measured host-to-VRAM copy rate. `rustingstrata calibrate` does not measure or write
+a split: it times the chunk, drafts and short-prompt threshold with the split the run will use, and `--split` is
+accepted for symmetry but ignored with a note. To compare card orders, calibrate `--device 1,0` too: each order has
+its own file (`strata-<model>-dev0-1.json`, `-dev1-0.json`), and a run uses the file of the order it is given.
+AMD cards clock down in the gaps while the other card works; `echo high >
 /sys/class/drm/cardN/device/power_dpm_force_performance_level` (as root, per card) took a two-card split from 44 to 57
 tok/s in one report.
 
@@ -257,6 +260,8 @@ file system that caches data, or from a tmpfs copy.
 When the model files fit in RAM with 4 GiB to spare, they are read into the page cache in the background from the
 start and nothing is dropped, so experts that run on the CPU do not wait for the drive on their first use.
 `STRATA_PRELOAD=1` forces that, `STRATA_PRELOAD=0` turns it off.
+A file on a network file system (SMB, NFS, a FUSE mount) is not read ahead, because that asks the server for the whole
+file at once: its pages are read when they are used (`STRATA_PRELOAD=1` reads it ahead all the same).
 
 Otherwise bytes copied to VRAM are dropped from the page cache (`MADV_DONTNEED`), so on a model close to the machine's
 RAM the experts that missed VRAM keep their pages; `STRATA_COLD_KEEP=1` only marks them reclaimable instead. `serve` learns

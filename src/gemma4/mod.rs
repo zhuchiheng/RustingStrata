@@ -101,7 +101,7 @@ fn strip_thinking(text: &str) -> String {
 
 /// GPU on, the weights in 90% of the free VRAM (a fixed 11 GB overcommitted a 12 GB card that other programs
 /// use, and left a larger card half empty).
-fn gpu_defaults() {
+pub fn gpu_defaults() {
     if std::env::var_os("STRATA_G4_CPU").is_some() { return; }
     for (k, v) in [("STRATA_DS_GPU", "1"), ("STRATA_DS_GPU_FRACTION", "0.9"), ("STRATA_DS_NOEVICT", "1")] {
         if std::env::var_os(k).is_none() { unsafe { std::env::set_var(k, v) } }
@@ -288,10 +288,20 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a crate::tokenizer::Tokenizer, name: &'a st
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
         // A failed feed leaves part of the prompt in the cache, so the next request starts over.
-        let logits = match feed(&mut m, &seq[keep..]) { Ok(l) => l, Err(e) => { m.reset(); return Err(e) } };
-        let prefill_s = t.elapsed().as_secs_f64();
-        let n = q.max_tokens.unwrap_or(256).min(ctx - ids.len());
         if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        let logits = match crate::serve::alive(c, q.stream, || feed(&mut m, &seq[keep..])) {
+            Ok(l) => l,
+            Err(e) => {
+                m.reset();
+                // The head of a stream is out, so the error is its last line (a response with a status cannot follow).
+                if !q.stream { return Err(e); }
+                eprintln!("request: {e:#}");
+                let _ = write!(c, "data: {}\n\n", json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}));
+                return Ok(crate::serve::Done { prompt: ids.len(), cached: keep, completion: 0, prefill_s: t.elapsed().as_secs_f64(), finish: "error" });
+            }
+        };
+        let prefill_s = t.elapsed().as_secs_f64();
+        let n = q.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
         let stream = q.stream;
         let chunk = |d: serde_json::Value, fin: Option<&str>| json!({"object": "chat.completion.chunk", "model": name, "choices": [{"index": 0, "delta": d, "finish_reason": fin}]});
         let (out, done) = decode_greedy(&tok, &mut m, &stop, logits, n, &mut |t| {
