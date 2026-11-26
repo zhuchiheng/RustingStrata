@@ -29,6 +29,9 @@ struct Engine {
     /// Run on the GPU (experts that do not fit in VRAM run on the CPU) instead of the CPU reference.
     #[arg(long)]
     gpu: bool,
+    /// Accelerate CPU generation using Q8_K activations. This can change logits and generated tokens.
+    #[arg(long)]
+    fast_cpu: bool,
     /// GPU context length (KV cache size) in tokens. Inkling 2, Hy4, GLM, DeepSeek and Gemma 4: the prompt plus reply
     /// limit, the model's trained context when not given (their caches grow with the text).
     #[arg(long, default_value_t = 4096)]
@@ -83,6 +86,9 @@ struct Engine {
     top_k: usize,
     #[arg(long, default_value_t = 1.0)]
     top_p: f32,
+    /// Drop the tokens whose probability is below this times the best one's (llama.cpp min-p; 0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    min_p: f32,
     /// Default presence penalty (OpenAI `presence_penalty`); needs --temp > 0. Qwen recommends 1.5 against loops.
     #[arg(long, default_value_t = 0.0)]
     presence_penalty: f32,
@@ -148,8 +154,14 @@ struct Engine {
     thinking_budget: usize,
     /// KV cache format (GPU): f16, q8 (q8_0, half KV memory), q4 (q4_0, quarter KV memory), or q2 (2-bit affine,
     /// 5.3x smaller KV memory for 512k-1M ctx; numerics differ from f16).
-    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2"])]
+    #[arg(long, default_value = "f16", value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo4-3", "turbo4-2", "turbo3", "turbo2", "turbo3-2"])]
     kv: String,
+    /// K cache type; overrides the K half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    k: Option<String>,
+    /// V cache type; overrides the V half of `--kv`. Supported: f16, q8, q4, q2, turbo4, turbo3, turbo2.
+    #[arg(long, value_parser = ["f16", "q8", "q4", "q2", "turbo4", "turbo3", "turbo2"])]
+    v: Option<String>,
     /// GPU backend: cuda, vulkan or hip [default: cuda if it loads, else vulkan].
     #[arg(long)]
     backend: Option<String>,
@@ -170,23 +182,48 @@ struct Engine {
     /// Sequences in GPU memory at once (`serve --parallel`).
     #[arg(skip)]
     parallel: usize,
-    /// Multimodal projector (mmproj) GGUF used by `--image`.
+    /// Multimodal projector (mmproj) GGUF used by `--image` (default: an `mmproj*.gguf` next to the model; `none`
+    /// loads no projector).
     #[arg(long)]
     mmproj: Option<PathBuf>,
 }
 
-fn set_kv_env(kv: &str) {
-    match kv {
-        "q8" | "q4" | "q2" => {
-            unsafe { std::env::set_var("STRATA_KV", kv) };
-            if kv == "q8" { unsafe { std::env::set_var("STRATA_KV_Q8", "1") }; }
-            else { unsafe { std::env::remove_var("STRATA_KV_Q8") }; }
-        }
-        _ => {
-            unsafe { std::env::remove_var("STRATA_KV") };
-            unsafe { std::env::remove_var("STRATA_KV_Q8") };
-        }
+/// Resolve the independent K and V cache types. `--kv` supplies both unless `--k`/`--v` override a half.
+fn effective_kv(kv: &str, k: Option<&str>, v: Option<&str>) -> anyhow::Result<(String, String)> {
+    let valid = |s: &str| matches!(s, "f16" | "q8" | "q4" | "q2" | "turbo4" | "turbo3" | "turbo2");
+    let base = match kv {
+        "turbo4-3" => ("turbo4", "turbo3"),
+        "turbo4-2" => ("turbo4", "turbo2"),
+        "turbo3-2" => ("turbo3", "turbo2"),
+        other => (other, other),
+    };
+    let (k, v) = match (k, v) {
+        (None, None) => base,
+        (Some(k), None) => (k, base.1),
+        (None, Some(v)) => (base.0, v),
+        (Some(k), Some(v)) => (k, v),
+    };
+    anyhow::ensure!(valid(k) && valid(v), "unsupported KV combination K={k}, V={v}");
+    Ok((k.to_string(), v.to_string()))
+}
+
+/// Publish the resolved types to both backends. `STRATA_KV_K`/`STRATA_KV_V` are independent; `STRATA_KV` is
+/// kept as a symmetric-only alias for code paths that have not been split yet (serve/Vulkan).
+fn set_kv_env(k: &str, v: &str) {
+    unsafe {
+        std::env::set_var("STRATA_KV_K", k);
+        std::env::set_var("STRATA_KV_V", v);
+        if k == v { std::env::set_var("STRATA_KV", k); }
+        else { std::env::remove_var("STRATA_KV"); }
+        if k == "q8" || v == "q8" { std::env::set_var("STRATA_KV_Q8", "1"); }
+        else { std::env::remove_var("STRATA_KV_Q8"); }
     }
+}
+
+fn set_kv_env_for(kv: &str, k: Option<&str>, v: Option<&str>) -> anyhow::Result<()> {
+    let (k, v) = effective_kv(kv, k, v)?;
+    set_kv_env(&k, &v);
+    Ok(())
 }
 
 /// `serve` options for a server that other people use (docs/HOSTING.md).
@@ -242,7 +279,7 @@ impl Runner<'_> {
     /// Feed a prompt; returns the logits after its last token.
     fn prefill(&mut self, ts: &[u32]) -> anyhow::Result<Vec<f32>> {
         match self {
-            Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| m.step(st, t)).last().unwrap_or_default()),
+            Runner::Cpu(m, st) => Ok(ts.iter().map(|&t| { let l = m.step(st, t); term::prefilled(1); l }).last().unwrap_or_default()),
             Runner::Gpu(g) => g.prefill(ts),
             Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("prefill on a slot or a model outside the main engine"),
         }
@@ -369,13 +406,27 @@ fn restore_calib_env() {
 }
 
 impl Engine {
+    /// The projector for `model`: `--mmproj`, else an `mmproj*.gguf` next to it; `--mmproj none` gives none.
+    fn mmproj_for(&self, model: &Path) -> Option<PathBuf> {
+        match &self.mmproj {
+            Some(p) if p.as_os_str() == "none" => None,
+            Some(p) => Some(p.clone()),
+            None => vision::find_sibling(model),
+        }
+    }
+
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
-    fn ds_env(&self) {
+    fn ds_env(&self) -> anyhow::Result<()> {
         // SAFETY: called at the start of a command, before any thread reads these variables.
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // Hy4: every expert on the GPU
-        if self.kv != "f16" && std::env::var_os("STRATA_KV").is_none() { set_kv_env(&self.kv); }
+        // `--k`/`--v` must take effect even when `--kv` is left at its f16 default; otherwise an Inkling 2
+        // mixed layout silently degrades to plain f16.
+        if (self.kv != "f16" || self.k.is_some() || self.v.is_some()) && std::env::var_os("STRATA_KV_K").is_none() {
+            set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Models on their own code path never call `Engine::runner`, the only place that reads a calibration file.
@@ -439,7 +490,7 @@ impl Engine {
             }
         }
         if self.llama_numerics { unsafe { std::env::set_var("STRATA_LLAMA_NUMERICS", "1") } }  // read by Gpu::new
-        set_kv_env(&self.kv);  // read by Gpu::new and Vk::new
+        set_kv_env_for(&self.kv, self.k.as_deref(), self.v.as_deref())?;  // read by Gpu::new and Vk::new
         let open = || backend::open_all(self.backend.as_deref(), &self.device);
         let bk = match self.gpu.then(open).transpose() {
             Err(e) if self.cpu_fallback => { say!("no GPU backend ({e:#}), running on the CPU"); None }
@@ -562,7 +613,7 @@ impl Engine {
         })
     }
     fn sampler(&self) -> Sampler {
-        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, rng: seed(self.seed),
+        Sampler { temp: self.temp, top_k: self.top_k, top_p: self.top_p, min_p: self.min_p, rng: seed(self.seed),
             presence: self.presence_penalty, frequency: self.frequency_penalty, repeat: self.repeat_penalty,
             last_n: self.penalty_last_n, dry_mult: self.dry_multiplier,
             dry_base: self.dry_base, dry_allowed: self.dry_allowed_length, ..Sampler::greedy() }
@@ -783,6 +834,10 @@ fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static 
 }
 
 impl Engine {
+    fn load_inference_model<'a>(&self, g: &'a Gguf, aux: Option<&'a Gguf>) -> anyhow::Result<Model<'a>> {
+        Model::load_with_matvec(g, aux, &self.lora_specs(), self.fast_cpu && !self.gpu)
+    }
+
     pub fn lora_specs(&self) -> Vec<(String, f32)> {
         self.lora.iter().map(|s| {
             if let Some(idx) = s.rfind(':') {
@@ -953,6 +1008,13 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
+    /// Replace this binary with the newest GitHub release (Linux and Windows x86_64). The old one is kept as
+    /// `<name>.old`.
+    Update {
+        /// Only say whether a newer release is out.
+        #[arg(long)]
+        check: bool,
+    },
     /// OpenAI-compatible HTTP server: POST /v1/chat/completions (streaming or not), GET /v1/models.
     /// One request at a time; temperature, top_k, top_p and seed are honored, greedy when left out. A request that
     /// extends the previous one's messages prefills only the new part (usage.prompt_tokens_details.cached_tokens);
@@ -1029,7 +1091,7 @@ enum Cmd {
         #[arg(long, default_value_t = 24)]
         samples: usize,
         /// Benchmark repetitions inside each sample; their mean is used and run-to-run spread is reported.
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 2)]
         reps: usize,
         /// Extra discarded run before each sample (off by default: it loads the model a second time).
         #[arg(long, default_value_t = 0)]
@@ -1038,7 +1100,7 @@ enum Cmd {
         #[arg(long, value_delimiter = ',', default_value = "128,512,2048")]
         pp: Vec<usize>,
         /// Tokens greedily decoded per workload.
-        #[arg(long, default_value_t = 128)]
+        #[arg(long, default_value_t = 64)]
         tg: usize,
         /// Prefill chunk sizes to search, comma-separated. [default: 256,512,1024,2048,4096]
         #[arg(long, value_delimiter = ',')]
@@ -1055,6 +1117,10 @@ enum Cmd {
         /// Per-sample time limit in seconds (0 = no limit). A timeout is recorded as a failed sample.
         #[arg(long, default_value_t = 0)]
         timeout: u64,
+        /// Time limit of the search in minutes (0 = none): no sample starts after it, and the best point so far is
+        /// written. The baseline comes before it.
+        #[arg(long, default_value_t = 30)]
+        minutes: u64,
         /// Keep the full benchmark report and sample trace in this directory.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -1230,6 +1296,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                    RUSTFLAGS=\"-C target-cpu=native\" (or x86-64-v3), or use a release binary.");
     }
     match cmd {
+        Cmd::Update { check } => rusting_strata::update::run(check)?,
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
             println!("{:#?}", ModelConfig::from_gguf(&g)?);
@@ -1259,7 +1326,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             // Kolibri and Inkling 2 have their own forwards: the continuation goes in a token at a time.
             macro_rules! score_tokenwise { ($chat:path, $model:path) => {{
                 use $chat as chat; use $model as Fwd;
-                engine.ds_env();
+                engine.ds_env()?;
                 chat::gpu_defaults();
                 let mut m = Fwd::new(&g)?;
                 let (mut argmax, mut top5) = (Vec::new(), Vec::new());
@@ -1298,13 +1365,14 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Generate { model, prompt, n, image, mut engine } => {
             engine.own_calib(&model);
-            engine.ds_env();
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
+            engine.ds_env()?;
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 if image.is_empty() { return rusting_strata::gemma4::generate(&g, &prompt, n); }
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 let input = load_images(mmproj, &image)?;
                 return rusting_strata::gemma4::generate_image(&g, &prompt, &input.grids, &input.embeddings, n);
@@ -1329,10 +1397,15 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 return rusting_strata::kolibri::chat::generate(&g, &prompt, n);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
+                let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
+                return rusting_strata::raon::chat::generate(&g, &prompt, n, engine.draft_model.as_deref());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let prompt = if prompt == "-" { let mut s = String::new(); std::io::stdin().read_to_string(&mut s)?; s } else { prompt };
                 let max_ctx = 0;
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
                     max_ctx,
                     sampler: engine.sampler(),
@@ -1350,7 +1423,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 return rusting_strata::inkling2::chat::generate_image_opts(&g, &prompt, Some((&input.grids, &input.embeddings)), n, opts);
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let prompt = if prompt == "-" {
                 let mut s = String::new();
@@ -1360,7 +1433,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let vision_prompt = if image.is_empty() {
                 None
             } else {
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 let input = load_images(mmproj, &image)?;
                 Some((build_image_prompt(&tok, &input, &image, &prompt)?, input))
@@ -1391,16 +1464,25 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Perplexity { model, file, ctx_len: n, chunks, kld_base, mut engine } => {
             let g = Gguf::open(&model)?;
-            let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
             let tok = Tokenizer::from_gguf(&g)?;
             // ponytail: no BOS at chunk starts (llama-perplexity adds one where the vocabulary asks for it; Qwen does not)
             let ids = tok.encode(&std::fs::read_to_string(&file)?)?;
             let n_chunk = (ids.len() / n).min(chunks.unwrap_or(usize::MAX));
             anyhow::ensure!(n >= 4 && n_chunk > 0, "{} tokens: need at least one chunk of --ctx-len {n} (>= 4)", ids.len());
             engine.ctx = engine.ctx.max(n);
-            let mut r = engine.runner(&m, &model)?;
-            let nv = m.cfg.n_vocab;
+            // Inkling 2 runs its own forward (`Model` does not load that architecture); it scores the same way, so
+            // `--kld-base` compares it with another build the same as it compares llama.cpp with the others.
+            let mut ink = if g.get("general.architecture").ok().and_then(|v| v.as_str()).is_some_and(rusting_strata::inkling2::is_arch) {
+                rusting_strata::inkling2::chat::gpu_defaults();
+                engine.ds_env()?;
+                Some(rusting_strata::inkling2::forward::Inkling2Model::new_with_ctx(&g, n)?)
+            } else {
+                None
+            };
+            let aux_g = if ink.is_none() { open_mtp_gguf(engine.aux_model_path())? } else { None };
+            let m = if ink.is_none() { Some(Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?) } else { None };
+            let mut r = match &m { Some(m) => Some(engine.runner(m, &model)?), None => None };
+            let nv = match (&ink, &m) { (Some(im), _) => im.cfg.n_vocab, (_, Some(m)) => m.cfg.n_vocab, _ => unreachable!() };
             let mut out = kld_base.map(|p| std::fs::File::create(p).map(std::io::BufWriter::new)).transpose()?;
             if let Some(o) = &mut out {
                 o.write_all(b"_logits_")?;
@@ -1410,10 +1492,19 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             let (mut nll, mut count, mut row) = (0f64, 0usize, Vec::new());
             let first = n / 2;
             for c in ids.chunks_exact(n).take(n_chunk) {
-                r.reset()?;
-                let mut logits = r.prefill(&c[..=first])?;
+                let mut logits = match (&mut ink, &mut r) {
+                    (Some(im), _) => { im.reset(); im.prefill(&c[..=first]) }
+                    (_, Some(run)) => { run.reset()?; run.prefill(&c[..=first])? }
+                    _ => unreachable!(),
+                };
                 for i in first..n - 1 {
-                    if i > first { logits = r.step(c[i])?; }
+                    if i > first {
+                        logits = match (&mut ink, &mut r) {
+                            (Some(im), _) => im.step(c[i]),
+                            (_, Some(run)) => run.step(c[i])?,
+                            _ => unreachable!(),
+                        };
+                    }
                     anyhow::ensure!(logits.len() == nv, "{} logits, vocabulary {nv}", logits.len());
                     nll += log_probs(&logits, c[i + 1], &mut row);
                     if let Some(o) = &mut out { for v in &row { o.write_all(&v.to_le_bytes())?; } }
@@ -1423,9 +1514,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             }
             if let Some(o) = &mut out { o.flush()?; }
             println!("\nPPL = {:.4} over {n_chunk} chunks of {n} tokens ({count} scored)", (nll / count as f64).exp());
-            r.finish()?;
+            if let Some(run) = &mut r { run.finish()?; }
         }
         Cmd::Bench { model, pp, tg, reps, json_out, prompt_file, mut engine } => {
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             if let Some(f) = &prompt_file {
                 let text = std::fs::read_to_string(f).with_context(|| format!("--prompt-file {}", f.display()))?;
                 anyhow::ensure!(!text.trim().is_empty(), "--prompt-file {} is empty", f.display());
@@ -1435,8 +1527,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             engine.own_warn(&g);
             engine.ctx = engine.ctx.max(pp.iter().max().unwrap_or(&0) + tg);
             if let Some(arch) = g.get("general.architecture").ok().and_then(|v| v.as_str()) {
-                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || rusting_strata::inkling2::is_arch(arch) {
-                    engine.ds_env();
+                if arch == "deepseek41" || arch == "glm5-next" || arch == "gemma4" || arch == rusting_strata::hy4::ARCH || arch == rusting_strata::kolibri::ARCH || arch == rusting_strata::raon::ARCH || rusting_strata::inkling2::is_arch(arch) {
+                    engine.ds_env()?;
                     // A --ctx below the test grows to fit it, as on the main engine.
                     if rusting_strata::CTX.load(std::sync::atomic::Ordering::Relaxed) != 0 { rusting_strata::CTX.store(engine.ctx, std::sync::atomic::Ordering::Relaxed); }
                     return if arch == "deepseek41" {
@@ -1447,6 +1539,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         bench_hy4(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if arch == rusting_strata::kolibri::ARCH {
                         bench_kolibri(&g, &model, &pp, tg, reps, json_out, &mut engine)
+                    } else if arch == rusting_strata::raon::ARCH {
+                        bench_raon(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else if rusting_strata::inkling2::is_arch(arch) {
                         bench_inkling2(&g, &model, &pp, tg, reps, json_out, &mut engine)
                     } else {
@@ -1455,7 +1549,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 }
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let mut r = engine.runner(&m, &model)?;
             let mut results = Vec::with_capacity(pp.len());
@@ -1511,8 +1605,8 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
         }
         Cmd::Calibrate { model, ctx, vram_margin, backend, device, split, kv, lora, gpu: _, mtp_model, draft_model,
                          samples, reps, warmup, pp, tg, chunk_values, task, seed,
-                         dry_run, timeout, out, sub } => {
-            set_kv_env(&kv);  // read by Gpu::new and Vk::new
+                         dry_run, timeout, minutes, out, sub } => {
+            set_kv_env_for(&kv, None, None)?;  // read by Gpu::new and Vk::new; expands turbo pair aliases
             if !lora.is_empty() { say!("note: --lora is ignored by calibrate; calibration uses the base model"); }
             if split.is_some() { say!("note: --split is ignored by calibrate; measurements use the free-VRAM split"); }
 
@@ -1539,7 +1633,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             settings.aux = draft_model.map(|p| ("--draft-model", p)).or_else(|| mtp_model.map(|p| ("--mtp-model", p)));
             settings.samples = samples; settings.reps = reps; settings.warmup = warmup; settings.pp = pp;
             settings.tg = tg; settings.tasks = task;
-            settings.seed = seed; settings.dry_run = dry_run; settings.timeout = timeout; settings.out = out;
+            settings.seed = seed; settings.dry_run = dry_run; settings.timeout = timeout; settings.minutes = minutes; settings.out = out;
             if settings.pp.is_empty() || settings.pp.iter().any(|&n| n == 0) { anyhow::bail!("--pp needs at least one positive prompt depth"); }
             if settings.samples == 0 { anyhow::bail!("--samples must be positive"); }
             if !model.is_dir() { return calibrate_v2(&settings); }
@@ -1569,6 +1663,11 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::kolibri::ARCH) {
                 let m = rusting_strata::kolibri::forward::KolibriModel::new(&g)?;
                 println!("check: kolibri1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
+                return Ok(());
+            }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                let m = rusting_strata::raon::forward::RaonModel::new(&g)?;
+                println!("check: raon1 ok: {} layers, {} experts ({} used), {} tensors, every tensor of the forward is present", m.cfg.n_layer, m.cfg.n_expert, m.cfg.n_used, g.tensors.len());
                 return Ok(());
             }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("deepseek41") {
@@ -1634,14 +1733,16 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             std::process::exit(cmd.status()?.code().unwrap_or(1));
         }
         Cmd::Chat { model, system, n, image, mut engine } => {
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
             let think = engine.think_default;
+            term::live(false);
             engine.own_calib(&model);
-            engine.ds_env();
+            engine.ds_env()?;
             let g = Gguf::open(&model)?;
             engine.own_warn(&g);
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some("gemma4") {
                 let input = if image.is_empty() { None } else {
-                    let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                    let mmproj = engine.mmproj_for(&model);
                     let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                     Some(load_images(mmproj, &image)?)
                 };
@@ -1666,9 +1767,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 anyhow::ensure!(image.is_empty(), "--image is not supported for kolibri1");
                 return rusting_strata::kolibri::chat::chat(&g, system, n, think);
             }
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::raon::ARCH) {
+                anyhow::ensure!(image.is_empty(), "--image is not supported for raon1");
+                return rusting_strata::raon::chat::chat(&g, system, n, think, engine.draft_model.as_deref());
+            }
             if g.get("general.architecture").ok().and_then(|v| v.as_str()) .is_some_and(rusting_strata::inkling2::is_arch) {
                 let max_ctx = 0;
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let opts = rusting_strata::inkling2::chat::Inkling2Opts {
                     max_ctx,
                     sampler: engine.sampler(),
@@ -1690,10 +1795,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 };
             }
             let aux_g = open_mtp_gguf(engine.aux_model_path())?;
-            let m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?;
+            let m = engine.load_inference_model(&g, aux_g.as_ref())?;
             let tok = Tokenizer::from_gguf(&g)?;
             let image_input = if image.is_empty() { None } else {
-                let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(&model));
+                let mmproj = engine.mmproj_for(&model);
                 let mmproj = mmproj.as_deref().context("--image needs --mmproj")?;
                 Some(load_images(mmproj, &image)?)
             };
@@ -1709,6 +1814,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                 if stdin.lock().read_line(&mut line)? == 0 { break; }
                 if line.trim().is_empty() { continue; }
                 msgs.push(Msg::new("user", line.trim_end()));
+                let _live = term::Live::start();
                 let prompt = tpl.render(&msgs, &[], think, engine.preserve_thinking, true);
                 let (ids, logits) = match &image_input {
                     Some(input) => {
@@ -1738,7 +1844,10 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
             r.finish()?;
         }
         Cmd::Serve { model, models_dir, addr, api_key, mcp, open, host, mut engine } => {
-            engine.ds_env();
+            rusting_strata::update::notice();
+            term::live(true);
+            let _ = effective_kv(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
+            engine.ds_env()?;
             anyhow::ensure!(host.auto_unload != Some(0), "--auto-unload must be at least 1 second");
             engine.parallel = host.parallel;
             // Before the model is loaded: a slot count outside 1..=255 is an invalid request, not a downgrade.
@@ -1929,7 +2038,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         _ => {}
                     }
                     // A customer key over `--max-per-key` is refused here, before it takes a place in the queue.
-                    let hold = match (who, per_key) {
+                    let hold = match (who.as_ref(), per_key) {
                         (Some(w), Some(cap)) if !w.admin => match serve::Hold::take(&held, w.id, cap) {
                             Some(h) => Some(h),
                             None => {
@@ -1942,6 +2051,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                         },
                         _ => None,
                     };
+                    // A streamed chat for a model that answers one request at a time gets its head while it waits.
+                    let mut q = q;
+                    if let Ok(r) = &mut q && st.lock().unwrap().own && r.method == "POST" && r.path == "/v1/chat/completions" && who.is_some()
+                        && (k.read().unwrap().any() || serve::host_ok(&r.host, &a, &allowed))
+                        && serde_json::from_slice::<serde_json::Value>(&r.body).is_ok_and(|v| v["stream"] == true) {
+                        r.queued = serve::Queued::start(&c).ok();
+                    }
                     let _ = tx.send((c, q, i, hold));
                 });
             });
@@ -1970,13 +2086,13 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     // The models outside the main engine read their limit here (`ctx_limit`).
                     if !o["ctx"].is_null() { rusting_strata::CTX.store(engine.ctx, Relaxed); }
                     // `runner` also sets it, and calibrate runs before `runner`.
-                    set_kv_env(&engine.kv);
+                    set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                 }
                 // The page's calibrate button: measure with no model loaded, then load with the measured chunk and MTP
                 // (they replace `--chunk`/`--mtp` and the page's earlier values).
                 let cal = if o["calibrate"] == true && engine.gpu {
                     (engine.chunk, engine.mtp) = (None, None);
-                    set_kv_env(&engine.kv);
+                    set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                     s.stats.lock().unwrap().unload(Some(s.name(&p)));
                     vram_margins(&engine.vram_margin, &engine.device)
                         .and_then(|mb| calibrate(&p, engine.aux_model_path(), engine.ctx, &mb.into_iter().map(|mb| mb << 20).collect::<Vec<_>>(), engine.backend.as_deref(), &engine.device,
@@ -2009,7 +2125,7 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                     Err(e) => {
                         engine = old;
                         rusting_strata::CTX.store(old_ctx, Relaxed);
-                        set_kv_env(&engine.kv);
+                        set_kv_env_for(&engine.kv, engine.k.as_deref(), engine.v.as_deref())?;
                         s.stats.lock().unwrap().unload(None);
                         say!("loading {}: {e:#}", p.display());
                         let b = json!({"error": {"message": format!("{e:#}"), "type": "server_error"}}).to_string();
@@ -2165,6 +2281,7 @@ fn $name(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out:
 }
 bench_tokenwise!(bench_hy4, rusting_strata::hy4::forward::Hy4Model);
 bench_tokenwise!(bench_kolibri, rusting_strata::kolibri::forward::KolibriModel);
+bench_tokenwise!(bench_raon, rusting_strata::raon::forward::RaonModel);
 
 /// `strata bench` for Gemma 4, with the `gpu_defaults` of its generate and chat paths.
 fn bench_gemma4(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
@@ -2215,7 +2332,9 @@ fn gemma_bench_chunk(v: Option<&str>) -> usize {
 
 /// `strata bench` for Inkling 2 (uses GPU argmax decode, plus `--draft-model` DSpark / `--spec-type` context lookup).
 fn bench_inkling2(g: &Gguf, model: &Path, pp: &[usize], tg: usize, reps: usize, json_out: Option<PathBuf>, engine: &mut Engine) -> anyhow::Result<()> {
-    rusting_strata::deepseek::chat::gpu_defaults();
+    // The same defaults `chat`, `generate` and `serve` set: without them the plain weights spread over both cards,
+    // `Device::new` refuses the second one and the whole benchmark runs the host path (about a fifth of the speed).
+    rusting_strata::inkling2::chat::gpu_defaults();
     let tok = Tokenizer::from_gguf(g)?;
     let max_ctx = engine.ctx.max(pp.iter().copied().max().unwrap_or(0) + tg + 64);
     let opts = rusting_strata::inkling2::chat::Inkling2Opts {
@@ -2342,6 +2461,7 @@ struct CalibSettings {
     seed: u64,
     dry_run: bool,
     timeout: u64,
+    minutes: u64,
     out: Option<PathBuf>,
     /// Only used by the `spec` subcommand.
     spec_types: Vec<String>,
@@ -2354,9 +2474,9 @@ impl CalibSettings {
     fn new(model: PathBuf) -> Self {
         Self {
             model, backend: None, device: vec![0], vram_margin: vec!["512".into()], kv: "f16".into(),
-            aux: None, ctx: 4096, samples: 24, reps: 3, warmup: 0, pp: vec![128, 512, 2048], tg: 128,
+            aux: None, ctx: 4096, samples: 24, reps: 2, warmup: 0, pp: vec![128, 512, 2048], tg: 64,
             chunk_values: vec![256, 512, 1024, 2048, 4096], tasks: vec!["prose".into()],
-            seed: 1, dry_run: false, timeout: 0, out: None,
+            seed: 1, dry_run: false, timeout: 0, minutes: 30, out: None,
             spec_types: vec![], draft_max: vec![], ngram_n: vec![], mtp_values: vec![],
         }
     }
@@ -2798,7 +2918,11 @@ fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
     let mut measure = measure_fn(s, &backend);
     let base_knobs = baseline_knobs(&space, &arch);
     say!("baseline (current defaults): {}", base_knobs.label());
+    let t0 = std::time::Instant::now();
     let (baseline, ok) = baseline_samples(measure(&base_knobs, &workloads));
+    let each = t0.elapsed().as_secs_f64();
+    let limit = if s.minutes > 0 { format!(", stopping after {} min (--minutes)", s.minutes) } else { String::new() };
+    say!("baseline took {each:.0} s; up to {} more samples of about that, {:.0} min{limit}", s.samples, each * s.samples as f64 / 60.0);
     if !ok { say!("warning: baseline failed (e.g. OOM at the default chunk); searching from a neutral reference"); }
     let backend_name = calib_backend_name(s, &backend);
     let gpu = calib_gpu_name(s, &backend_name);
@@ -2808,7 +2932,8 @@ fn calibrate_v2(s: &CalibSettings) -> anyhow::Result<()> {
         say!("written to {}", path.display());
         return Ok(());
     }
-    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
+    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed,
+                             deadline: (s.minutes > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(s.minutes * 60)) };
     let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), &base_knobs, baseline, &mut measure)?;
     anyhow::ensure!(result.best.error.is_none(), "no successful measurement; calibration not written");
     // The baseline competes at score calibrate::MIN_GAIN, so this only happens when the baseline measurement itself failed. Never
@@ -2870,7 +2995,8 @@ fn calibrate_spec(s: &CalibSettings) -> anyhow::Result<()> {
     let (baseline, ok) = baseline_samples(measure(&base, &workloads));
     if !ok { say!("warning: baseline failed; searching from a neutral reference"); }
     say!("baseline (current defaults): {}", base.label());
-    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed };
+    let cfg = SearchConfig { samples: s.samples, coarse: (s.samples / 3).min(8), starts: 3, patience: 2, seed: s.seed,
+                             deadline: (s.minutes > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(s.minutes * 60)) };
     let result = calibrate::search(&space, &workloads, &cfg, &Objective::balanced(), &base, baseline, &mut measure)?;
     anyhow::ensure!(result.best.error.is_none(), "no successful spec measurement; calibration not written");
     if result.best.score < 1.0 {
@@ -2938,34 +3064,37 @@ fn decode(r: &mut Runner, tok: &Tokenizer, mtp: bool, smp: &mut Sampler, mut log
     let (mut out, mut start, mut row, mut ahead, mut stopped) = (Vec::new(), 0, 0, None, false);
     let (mut in_think, budget) = think_cap.unwrap_or((false, 0));
     let (mut saw_close, mut tail) = (false, String::new());
+    // With a logit_bias or grammar every token is picked from the logits here: no speculation, no argmax on the GPU.
+    let free = smp.limit.is_none();
     'outer: while out.len() < n {
         let next = match ahead.take() { Some(t) => t, None => smp.pick(&logits)? as u32 };
         if eos.contains(&next) { stopped = true; break; }
         let toks = match r {
-            Runner::Gpu(g) if mtp && g.ngram.is_some() => {
+            Runner::Gpu(g) if free && mtp && g.ngram.is_some() => {
                 let (toks, nx, rw) = g.hybrid_spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
-            Runner::Gpu(g) if mtp => {
+            Runner::Gpu(g) if free && mtp => {
                 let (toks, nx, rw) = g.spec_step(next, row, smp)?;
                 (ahead, row) = (Some(nx), rw);
                 toks
             }
-            Runner::Gpu(g) if g.ngram.is_some() => {
+            Runner::Gpu(g) if free && g.ngram.is_some() => {
                 let (toks, nx) = g.ngram_spec_step(next, smp)?;
                 ahead = Some(nx);
                 toks
             }
             // Greedy without MTP: the argmax on the GPU, so only the token id is copied back, not the logits.
-            Runner::Gpu(g) if smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
-            Runner::Slot(c) if smp.temp <= 0.0 => { ahead = Some(c.step(next, false)?.0); vec![next] }
+            Runner::Gpu(g) if free && smp.temp <= 0.0 => { ahead = Some(g.step_greedy(next)?); vec![next] }
+            Runner::Slot(c) if free && smp.temp <= 0.0 => { ahead = Some(c.step(next, false)?.0); vec![next] }
             _ => { logits = r.step(next)?; vec![next] }
         };
         for t in toks {
             if eos.contains(&t) { stopped = true; break 'outer; }
             if out.len() == n { break; }
             out.push(t);
+            term::decoded(1);
             let s = tok.decode(&out[start..])?;
             if !s.ends_with('\u{fffd}') {
                 if budget > 0 && !saw_close {
@@ -3346,8 +3475,9 @@ impl Sched {
     /// (fewer graphs to capture).
     fn run(&mut self, g: &mut GpuModel) {
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
-        // should measure it per model and machine. STRATA_BATCH_MIN overrides.
-        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
+        // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
+        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 8 });
         let big = g.batch_cap() > 0 && self.steps.len() >= min;
         let cap = if big { g.batch_cap() } else { rusting_strata::gpu_model::STEP_ROWS };
         let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
@@ -3585,20 +3715,21 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
     let _own = rusting_strata::config::OWN_ARCHS.contains(&arch).then(OwnState::new);
     let (aux_g, m);
     let mut r = if _own.is_some() {
-        let mmproj = engine.mmproj.clone().or_else(|| vision::find_sibling(model));
+        let mmproj = engine.mmproj_for(model);
         Runner::Own(match arch {
             "gemma4" => rusting_strata::gemma4::serve(&g, &tok, &name, mmproj.as_deref())?,
             "glm5-next" => rusting_strata::glm::serve(&g, &tok, &name)?,
             "deepseek41" => rusting_strata::deepseek::chat::serve(&g, &tok, &name)?,
             rusting_strata::hy4::ARCH => rusting_strata::hy4::chat::serve(&g, &tok, &name)?,
             rusting_strata::kolibri::ARCH => rusting_strata::kolibri::chat::serve(&g, &tok, &name)?,
+            rusting_strata::raon::ARCH => rusting_strata::raon::chat::serve(&g, &tok, &name)?,
             _ => rusting_strata::inkling2::chat::serve(&g, &tok, &name, rusting_strata::inkling2::chat::Inkling2Opts {
                 max_ctx: 0, sampler: engine.sampler(), thinking_budget: engine.thinking_budget, think_default: engine.think_default,
                 mmproj, draft_model: engine.draft_model.clone(), ngram_cfg: engine.ngram_config()? })?,
         })
     } else {
         aux_g = open_mtp_gguf(engine.aux_model_path())?;
-        m = { let mut m = Model::load_with_aux(&g, aux_g.as_ref(), &engine.lora_specs())?; if !engine.lora.is_empty() { m.apply_lora(&engine.lora_specs())?; } m };
+        m = engine.load_inference_model(&g, aux_g.as_ref())?;
         engine.runner(&m, model)?
     };
     // Serving decodes one reply after a (usually cached) prompt: follow the reply's routing, not the prompt's.
@@ -3611,6 +3742,7 @@ fn serve_model(model: &Path, mut engine: Engine, s: &Serving, w: &mut Option<Tcp
             Runner::Own(_) => { let d = rusting_strata::deepseek::mat::dev_stats(); (d.as_ref().map_or("cpu", |d| d.0).into(), d.map(|d| d.1).unwrap_or_default(), rusting_strata::ctx_limit(st.ctx_train.unwrap_or(0) as usize), 1) }
             _ => ("cpu".into(), String::new(), engine.ctx, 1),
         };
+        st.own = matches!(r, Runner::Own(_));
         gpu_stats(&r, &mut st);
     }
     let mut l = Loaded { r, tok: &tok, tpl: if _own.is_some() { Template::Xml } else { template(&g) }, name: name.clone(), path: model.to_path_buf() };
@@ -3720,8 +3852,12 @@ fn anthropic_refused(w: &mut TcpStream, r: &Runner) -> bool {
 
 fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Loaded>, e: &Engine, s: &Serving, i: usize,
     next: &mut Option<(PathBuf, TcpStream)>) -> anyhow::Result<()> {
+    // The response head of a streamed chat that waited in the queue may be out already: then a refusal is one
+    // error line of the stream.
+    let head_sent = q.as_ref().ok().and_then(|r| r.queued.as_ref()).is_some_and(|x| x.take());
     let send = |w: &mut TcpStream, status: &str, v: serde_json::Value| -> anyhow::Result<()> {
         let b = v.to_string();
+        if head_sent { return Ok(write!(w, "data: {b}\n\n")?) }
         Ok(write!(w, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len())?)
     };
     // A malformed request gets a 400 (best effort: the client may be gone) and is still logged.
@@ -3743,14 +3879,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
     // Claude Code adds `?beta=true`.
     let route = path.split('?').next().unwrap_or_default();
     // Customer keys may not load models, download files or read the server's stats.
-    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models") {
-        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens) and /v1/models", "type": "permission_error"}}));
+    if !who.admin && !matches!(route, "/v1/chat/completions" | "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models" | "/tokenize" | "/detokenize") {
+        return send(&mut w, "403 Forbidden", json!({"error": {"message": "this key may use only /v1/chat/completions, /v1/messages (and count_tokens), /v1/models, /tokenize and /detokenize", "type": "permission_error"}}));
     }
     match (method.as_str(), route) {
         ("GET", "/api/models") => {
             // The model `--auto-unload` freed counts as loaded: a chat loads it again.
             let asleep = s.asleep.lock().unwrap().clone();
-            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj.is_some() || vision::find_sibling(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p) || asleep.as_ref() == Some(&p)})).collect();
+            let models: Vec<_> = s.models().into_iter().map(|(id, p, n)| json!({"id": id, "bytes": n, "image": e.mmproj_for(&p).is_some(), "loaded": l.as_ref().is_some_and(|l| l.path == p) || asleep.as_ref() == Some(&p)})).collect();
             // The values in effect: with a model loaded, `chunk` and `mtp` include its calibration.
             let options = json!({"ctx": e.ctx, "kv": e.kv, "cache_ram": e.cache_ram, "vram_margin": e.vram_margin.join(","), "mtp": e.mtp, "chunk": e.chunk,
                 "gpu": e.gpu, "ctx_train": s.stats.lock().unwrap().ctx_train,
@@ -3802,6 +3938,14 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             });
             send(&mut w, "202 Accepted", json!(*s.dl.lock().unwrap()))
         }
+        // llama.cpp's tokenizer endpoints.
+        ("POST", p @ ("/tokenize" | "/detokenize")) => {
+            let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
+            match if p == "/tokenize" { serve::tokenize(l.tok, &body) } else { serve::detokenize(l.tok, &body) } {
+                Ok(v) => send(&mut w, "200 OK", v),
+                Err(err) => send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+            }
+        }
         // The prompt's tokens as the model would see them, template and tools included.
         ("POST", "/v1/messages/count_tokens") => {
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
@@ -3811,7 +3955,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     let prompt = l.tpl.render(&req.messages, &req.tools, req.think.unwrap_or(e.think_default), req.preserve_thinking.unwrap_or(e.preserve_thinking), true);
                     let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
                     let n = if images.is_empty() { l.tok.encode(&prompt)?.len() } else {
-                        let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                        let mmproj = e.mmproj_for(&l.path);
                         let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
                         let input = load_images(mmproj, &images)?;
                         build_image_prompt(l.tok, &input, &images, &prompt)?.ids.len()
@@ -3826,6 +3970,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let anth = p == "/v1/messages";
             let Some(l) = l else { return send(&mut w, "503 Service Unavailable", json!({"error": {"message": "no model loaded", "type": "server_error"}})) };
             if anth && anthropic_refused(&mut w, &l.r) { return Ok(()); }
+            let _live = term::Live::start();
             let (r, tok, tpl, name) = (&mut l.r, &l.tok, l.tpl, l.name.as_str());
             match r { Runner::Gpu(g) => g.owner = who.id, Runner::Slot(c) => (c.owner, c.conn) = (who.id, w.try_clone().ok()), _ => {} }
             let mut req = match if anth { serve::messages_body(&body) } else { Ok(body.clone()) }.and_then(|b| serve::chat_request(&b)) {
@@ -3853,6 +3998,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             };
             // A model outside the main engine answers the request itself (greedy; it fails before it writes).
             if let Runner::Own(chat) = r {
+                req.head_sent = head_sent;
                 if s.max_tokens < usize::MAX { req.max_tokens = Some(req.max_tokens.unwrap_or(s.max_tokens).min(s.max_tokens)); }
                 say!("request: {method} {p} key={key_name} model={name} messages={} stream={} tools={}", req.messages.len(), req.stream, req.tools.len());
                 s.stats.lock().unwrap().busy += 1;
@@ -3876,6 +4022,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     }
                 };
             }
+            if head_sent { return send(&mut w, "", json!({"error": {"message": "the model changed while this request waited; send it again", "type": "server_error"}})); }
             // Room is checked on the full prompt before any state changes.
             let preserve = req.preserve_thinking.unwrap_or(e.preserve_thinking);
             // An assistant message at the end is continued, not answered: the prompt stops inside it.
@@ -3887,7 +4034,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let system = tpl.render(&req.messages[..n_sys], &req.tools, req.think.unwrap_or(e.think_default), preserve, false);
             let images: Vec<String> = req.messages.iter().flat_map(|m| m.images.iter().cloned()).collect();
             let image_input = if images.is_empty() { None } else {
-                let mmproj = e.mmproj.clone().or_else(|| vision::find_sibling(&l.path));
+                let mmproj = e.mmproj_for(&l.path);
                 let mmproj = mmproj.as_deref().context("image input needs --mmproj")?;
                 Some(load_images(mmproj, &images)?)
             };
@@ -3903,6 +4050,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.temp = req.temperature.unwrap_or(smp.temp);
             smp.top_k = req.top_k.unwrap_or(smp.top_k);
             smp.top_p = req.top_p.unwrap_or(smp.top_p);
+            smp.min_p = req.min_p.unwrap_or(smp.min_p);
             smp.presence = req.presence_penalty.unwrap_or(smp.presence);
             smp.frequency = req.frequency_penalty.unwrap_or(smp.frequency);
             smp.repeat = req.repeat_penalty.unwrap_or(smp.repeat);
@@ -3912,9 +4060,13 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             smp.dry_allowed = req.dry_allowed_length.unwrap_or(smp.dry_allowed);
             if smp.dry_mult > 0.0 { smp.dry_breakers = dry_breakers(tok, name); }
             smp.tool_tags = tok.token_id("<tool_call>").zip(tok.token_id("</tool_call>")).map(|(a, b)| (a as usize, b as usize));
-            say!("sampling: temp={} top_k={} top_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p,
+            say!("sampling: temp={} top_k={} top_p={} min_p={} presence={} frequency={} repeat={}/{} dry={}/{}/{}", smp.temp, smp.top_k, smp.top_p, smp.min_p,
                 smp.presence, smp.frequency, smp.repeat, smp.last_n, smp.dry_mult, smp.dry_base, smp.dry_allowed);
             if req.seed.is_some() { smp.rng = seed(req.seed); }
+            smp.limit = match rusting_strata::grammar::Constraint::new(&req, tok) {
+                Ok(c) => c,
+                Err(err) => return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("{err:#}"), "type": "invalid_request_error"}})),
+            };
             let n = room(e, ids.len(), req.max_tokens.unwrap_or(usize::MAX).min(s.max_tokens));
             if n == 0 { return send(&mut w, "400 Bad Request", json!({"error": {"message": format!("prompt of {} tokens fills the context", ids.len()), "type": "invalid_request_error"}})); }
             let id = format!("chatcmpl-{i}");
@@ -4261,6 +4413,29 @@ mod bench_tests {
     use clap::Parser;
     use serde_json::Value;
     use std::path::Path;
+
+    #[test]
+    fn cpu_inference_loader_selects_requested_numerics() {
+        use super::{Cmd, Gguf, Model, State, ops};
+        let Some(path) = std::env::var_os("STRATA_CPU_PARITY_MODEL") else { return };
+        let g = Gguf::open(Path::new(&path)).unwrap();
+        let reference = Model::load(&g).unwrap();
+        let Some(Cmd::Bench { mut engine, .. }) = Cli::parse_from(["rustingstrata", "bench", "--model", "fixture"]).cmd else { unreachable!() };
+        let model = engine.load_inference_model(&g, None).unwrap();
+        let mut a = State::new(&reference.cfg);
+        let mut b = State::new(&model.cfg);
+        let mut token = 42;
+        for _ in 0..4 {
+            let want = reference.step(&mut a, token);
+            let got = model.step(&mut b, token);
+            assert_eq!(got, want, "CPU generation logits changed at step {}", b.pos);
+            token = ops::argmax(&want) as u32;
+        }
+        engine.fast_cpu = true;
+        let fast = engine.load_inference_model(&g, None).unwrap();
+        let expected = Model::load_with_matvec(&g, None, &[], true).unwrap();
+        assert_eq!(fast.step(&mut State::new(&fast.cfg), token), expected.step(&mut State::new(&expected.cfg), token));
+    }
 
     fn meta() -> BenchMeta<'static> {
         BenchMeta {
@@ -4641,5 +4816,43 @@ mod calibrate_cli_tests {
         let b = spec_baseline(&s);
         assert_eq!((b.i("spec_type"), b.i("draft_max"), b.i("ngram_n"), b.i("mtp")),
                    (Some(1), Some(2), Some(2), Some(0)));
+    }
+}
+
+#[cfg(test)]
+mod kv_type_tests {
+    use super::effective_kv;
+
+    fn pair(kv: &str, k: Option<&str>, v: Option<&str>) -> (String, String) {
+        effective_kv(kv, k, v).unwrap()
+    }
+
+    #[test]
+    fn symmetric_flag_and_overrides() {
+        assert_eq!(pair("f16", None, None), ("f16".into(), "f16".into()));
+        assert_eq!(pair("turbo4", None, None), ("turbo4".into(), "turbo4".into()));
+        assert_eq!(pair("f16", Some("turbo4"), None), ("turbo4".into(), "f16".into()));
+        assert_eq!(pair("f16", None, Some("q8")), ("f16".into(), "q8".into()));
+    }
+
+    #[test]
+    fn turbo_aliases_expand_to_independent_types() {
+        assert_eq!(pair("turbo4-3", None, None), ("turbo4".into(), "turbo3".into()));
+        assert_eq!(pair("turbo4-2", None, None), ("turbo4".into(), "turbo2".into()));
+        assert_eq!(pair("turbo3-2", None, None), ("turbo3".into(), "turbo2".into()));
+    }
+
+    #[test]
+    fn arbitrary_kv_pairs_are_allowed() {
+        assert_eq!(pair("f16", Some("f16"), Some("q4")), ("f16".into(), "q4".into()));
+        assert_eq!(pair("f16", Some("q8"), Some("turbo4")), ("q8".into(), "turbo4".into()));
+        assert_eq!(pair("f16", Some("turbo3"), Some("turbo2")), ("turbo3".into(), "turbo2".into()));
+        assert_eq!(pair("f16", Some("turbo4"), Some("turbo3")), ("turbo4".into(), "turbo3".into()));
+    }
+
+    #[test]
+    fn invalid_types_are_rejected() {
+        assert!(effective_kv("f16", Some("bogus"), None).is_err());
+        assert!(effective_kv("f16", None, Some("turbo9")).is_err());
     }
 }

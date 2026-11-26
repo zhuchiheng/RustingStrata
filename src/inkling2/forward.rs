@@ -787,6 +787,11 @@ impl<'a> Inkling2Model<'a> {
             share.or(std::env::var_os("STRATA_FIXED_EXPERTS").map(|_| 0.0))
         });
         if crate::deepseek::mat::dev_info().is_none() { return (1.0, true); }
+        // A single token (and a draft check) gives every miss to the CPU: staging an expert costs an allocation,
+        // copies and a wait a layer run, which the balance does not see as a fixed cost. On an RTX 2060 under Windows
+        // the staged share cost 230-290 ms a token (decode 2.4 tok/s, 6.1 with none); on an RTX 3060 under Linux
+        // staging none was also the fastest (17.0 tok/s against 16.1).
+        let fixed = fixed.or(std::ptr::eq(share, &self.cpu_share).then_some(1.0));
         (fixed.unwrap_or(share.get()).clamp(0.0, 1.0), fixed.is_some())
     }
 
@@ -808,7 +813,7 @@ impl<'a> Inkling2Model<'a> {
         // share; 0 (also `--fixed-experts`) runs every expert on the GPU: the same numerics on every run.
         self.lap(4, t);
         let (share, fixed) = self.share(&self.cpu_share);
-        let gus: Vec<Mat> = sel.iter().map(|s| l.gate_up.expert_opt(s.0, ne, share == 0.0)).collect();
+        let gus: Vec<Mat> = sel.iter().map(|s| l.gate_up.expert_opt_in(s.0, ne, share == 0.0, &l.gate_up, l.down.data.len())).collect();
         let n_miss = gus.iter().filter(|m| m.gpu.is_none()).count();
         let mut left = (share * n_miss as f32).round() as usize;
         let (mut on_gpu, mut on_cpu) = (vec![], vec![]);
@@ -825,7 +830,7 @@ impl<'a> Inkling2Model<'a> {
 
     /// The GPU's experts of `plan` with both matrices in VRAM: in a cache slot, or copied up for this use.
     fn resident(l: &Layer<'a>, ne: usize, on_gpu: &[(Mat<'a>, usize, f32)]) -> Vec<(Mat<'a>, Mat<'a>, f32, f32)> {
-        let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, true); if x.gpu.is_some() { x } else { x.staged() } };
+        let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt_in(e, ne, true, &l.gate_up, l.down.data.len()); if x.gpu.is_some() { x } else { x.staged() } };
         on_gpu.iter().map(|&(gu, e, w)| (if gu.gpu.is_some() { gu } else { on(&l.gate_up, e) }, on(&l.down, e), w, l.gu_scale[e])).collect()
     }
 
@@ -876,8 +881,8 @@ impl<'a> Inkling2Model<'a> {
         // split of the prefill chunks alone.
         let cell = if xs.len() <= device::VERIFY_MAX { &self.cpu_share } else { &self.chunk_share };
         let (share, fixed) = self.share(cell);
-        let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt(e, ne, share == 0.0); if x.gpu.is_some() { x } else { x.staged() } };
-        let gus: Vec<(usize, Mat)> = by_e.keys().map(|&e| (e, l.gate_up.expert_opt(e, ne, share == 0.0))).collect();
+        let on = |m: &Mat<'a>, e: usize| { let x = m.expert_opt_in(e, ne, share == 0.0, &l.gate_up, l.down.data.len()); if x.gpu.is_some() { x } else { x.staged() } };
+        let gus: Vec<(usize, Mat)> = by_e.keys().map(|&e| (e, l.gate_up.expert_opt_in(e, ne, share == 0.0, &l.gate_up, l.down.data.len()))).collect();
         let n_miss = gus.iter().filter(|g| g.1.gpu.is_none()).count();
         let mut left = (share * n_miss as f32).round() as usize;
         let (mut on_gpu, mut on_cpu) = (vec![], vec![]);
@@ -1030,7 +1035,7 @@ impl<'a> Inkling2Model<'a> {
                     return out;
                 }
                 Err(e) => {
-                    eprintln!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do");
+                    crate::say!("inkling2: no room in VRAM for the decode state ({e:#}); the tokens run as prompt chunks do");
                     d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
                     self.no_device = true;
                 }
@@ -1079,13 +1084,13 @@ impl<'a> Inkling2Model<'a> {
                         return res;
                     }
                     Err(e) => {
-                        eprintln!("inkling2: GPU verify failed ({e:#}); falling back to host");
+                        crate::say!("inkling2: GPU verify failed ({e:#}); falling back to host");
                         d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
                         self.no_device = true;
                     }
                 },
                 Err(e) => {
-                    eprintln!("inkling2: no room in VRAM for verify ({e:#}); falling back to host");
+                    crate::say!("inkling2: no room in VRAM for verify ({e:#}); falling back to host");
                     d.to_host(&self.cfg, &self.layers, &mut self.slots, pos0, self.max_ctx);
                     self.no_device = true;
                 }
@@ -1304,7 +1309,7 @@ impl<'a> Inkling2Model<'a> {
                 let target_end = self.toks.len() + seq.len() - 1;
                 match d.prepare(self, target_end) {
                     Ok(()) => {
-                        let chunk = env_chunk.unwrap_or(256).clamp(1, 256);
+                        let chunk = env_chunk.unwrap_or(device::pf_tokens()).clamp(1, device::pf_tokens());
                         let mut logits = vec![];
                         let mut done = 0usize;
                         let mut failed = None;
@@ -1318,13 +1323,14 @@ impl<'a> Inkling2Model<'a> {
                                         ds.inject_subset(pos0, c.len(), c.len(), f);
                                     }
                                     done += c.len();
+                                    crate::term::prefilled(c.len());
                                     if want { logits = l; }
                                 }
                                 Err(e) => { failed = Some(e); break; }
                             }
                         }
                         if let Some(e) = failed {
-                            eprintln!("inkling2: GPU prefill failed ({e:#}); falling back to host chunk path");
+                            crate::say!("inkling2: GPU prefill failed ({e:#}); falling back to host chunk path");
                             let pos = self.toks.len();
                             d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
                             self.no_device = true;
@@ -1340,7 +1346,7 @@ impl<'a> Inkling2Model<'a> {
                         return logits;
                     }
                     Err(e) => {
-                        eprintln!("inkling2: no room in VRAM for prefill ({e:#}); falling back to host chunk path");
+                        crate::say!("inkling2: no room in VRAM for prefill ({e:#}); falling back to host chunk path");
                         let pos = self.toks.len();
                         d.to_host(&self.cfg, &self.layers, &mut self.slots, pos, self.max_ctx);
                         self.no_device = true;
@@ -1351,7 +1357,7 @@ impl<'a> Inkling2Model<'a> {
         let mut chunk = env_chunk.unwrap_or(512);
         if dump_or_trace { chunk = 1; }
         let mut logits = vec![];
-        for (i, c) in seq.chunks(chunk.max(1)).enumerate() { logits = self.run_seq(c, (i + 1) * chunk.max(1) >= seq.len()); }
+        for (i, c) in seq.chunks(chunk.max(1)).enumerate() { logits = self.run_seq(c, (i + 1) * chunk.max(1) >= seq.len()); crate::term::prefilled(c.len()); }
         if let Some(ng) = &mut self.ngram { ng.begin(&self.toks); }
         logits
     }

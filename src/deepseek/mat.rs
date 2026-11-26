@@ -21,14 +21,14 @@ pub(crate) mod dev {
     const SHIFT: u32 = 24;
     pub fn gpu_of(id: u32) -> usize { (id >> SHIFT) as usize }
     pub(crate) struct Part { pub(crate) be: Box<dyn Backend>, ts: Vec<GpuTensor>, x: Buf, y: Buf, stage: Buf, bytes: usize, pub(crate) budget: usize, room: usize }
-    pub struct SlabBuf { buf: Buf, bytes: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
+    pub struct SlabBuf { buf: Buf, bytes: usize, acct: usize, freed: std::sync::Arc<std::sync::atomic::AtomicUsize> }
     impl SlabBuf {
         pub fn addr(&self) -> u64 { self.buf.addr() }
         pub fn len(&self) -> usize { self.bytes }
     }
     impl Drop for SlabBuf {
         fn drop(&mut self) {
-            self.freed.fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
+            self.freed.fetch_add(self.acct, std::sync::atomic::Ordering::Relaxed);
         }
     }
     #[derive(Default)]
@@ -42,6 +42,11 @@ pub(crate) mod dev {
         now: u64,
         cur: usize,
         lookups: u64,
+        /// Local patch (multi-GPU): the stacked expert tensor (base address, bytes) of the expert being looked up.
+        group: Option<(usize, usize)>,
+        /// Local patch: stacked expert tensor base address -> GPU that holds all of its experts; bytes promised per GPU.
+        aff: std::collections::HashMap<usize, usize>,
+        aff_bytes: Vec<usize>,
     }
     static DEV: LazyLock<Mutex<Dev>> = LazyLock::new(Default::default);
     /// Whether `DEV` is open: None before the first `get` and after `free`.
@@ -68,11 +73,43 @@ pub(crate) mod dev {
         let f: Vec<f64> = v.split(',').filter_map(|p| p.trim().parse().ok()).collect();
         match f[..] { [small, large] => if free < 8 << 30 { small } else { large }, [v] => v, _ => 0.8 }
     }
+    /// Free VRAM GPU 0 keeps after the plain weights for the decode state, the KV growth and the prefill scratch.
+    /// Those buffers are allocated outside the weight budget, so the reserve is checked against live free VRAM.
+    const STATE_RESERVE: usize = 768 << 20;
+    /// Whether `len` more plain-weight bytes fit GPU 0's budget and still leave `STATE_RESERVE` free there.
+    fn plain_first_fits(bytes: usize, len: usize, budget: usize, free: usize) -> bool {
+        bytes.saturating_add(len) <= budget && free >= len.saturating_add(STATE_RESERVE)
+    }
+    fn plain_first_enabled_from(v: Option<&str>) -> bool { v.is_some_and(|v| v != "0") }
+    fn plain_first_enabled() -> bool { plain_first_enabled_from(std::env::var("STRATA_DS_PLAIN_FIRST").ok().as_deref()) }
     #[test]
     fn gpu_fraction_takes_one_value_or_a_pair() {
         let gb = |n: usize| n << 30;
         assert_eq!([gpu_fraction("", gb(4)), gpu_fraction("0.9", gb(4)), gpu_fraction("x", gb(4))], [0.8, 0.9, 0.8]);
         assert_eq!([gpu_fraction("0.6,0.9", gb(4)), gpu_fraction("0.6, 0.9", gb(11))], [0.6, 0.9]);
+    }
+    #[test]
+    fn plain_first_reserves_the_state() {
+        let budget = 1 << 30;
+        assert!(plain_first_fits(0, 100, budget, 100 + STATE_RESERVE));
+        assert!(!plain_first_fits(0, 100, budget, 100 + STATE_RESERVE - 1)); // free VRAM too low
+        assert!(!plain_first_fits(budget, 100, budget, 1 << 40));            // budget full
+    }
+    #[test]
+    fn plain_first_env_zero_is_off() {
+        assert!(!plain_first_enabled_from(None));
+        assert!(!plain_first_enabled_from(Some("0")));
+        assert!(plain_first_enabled_from(Some("1")));
+    }
+    #[test]
+    fn expert_group_is_consumed_on_a_cache_hit() {
+        let mut d = Dev::default();
+        let data = vec![0u8; 8];
+        let k = data.as_ptr() as usize;
+        d.ex.insert(k, 0);
+        d.exs.push((0, k, 1, 1.0));
+        assert_eq!(d.expert_grouped((0x1000, 64), &data, GgmlType::F32, 0, 0, 1.0, false), Some(0));
+        assert!(d.group.is_none());
     }
     fn open() -> Option<Dev> {
         // Unset or 0: every matvec runs on the CPU.
@@ -135,20 +172,22 @@ pub(crate) mod dev {
                 p.budget.saturating_sub(b)
             }).sum()
         }
-        /// Allocates and uploads a contiguous buffer inside GPU 0 when both `p.budget` and live `mem_info()` keep the
-        /// given byte reserves free. Static mmap slices with `cache_key` deduplicate across multiple model instances.
-        pub fn alloc_slab(&mut self, data: &[u8], cache_key: Option<(usize, usize)>, budget_reserve: usize, free_reserve: usize) -> Option<std::sync::Arc<SlabBuf>> {
+        /// Allocates and uploads a contiguous buffer on GPU `d` when both `p.budget` and live `mem_info()` keep the given byte
+        /// reserves free; static mmap slices with `cache_key` deduplicate across model instances. A slab on a GPU other than 0 is checked against
+        /// the live free VRAM only, and stays out of the expert budget bookkeeping (which `freed` tracks for GPU 0).
+        pub fn alloc_slab_on(&mut self, d: usize, data: &[u8], cache_key: Option<(usize, usize)>, budget_reserve: usize, free_reserve: usize) -> Option<std::sync::Arc<SlabBuf>> {
             self.reclaim();
+            let cache_key = cache_key.map(|k| (k.0, k.1 | d << 60));
             if let Some(k) = cache_key && let Some(hit) = self.slabs.get(&k).and_then(std::sync::Weak::upgrade) {
                 return Some(hit);
             }
-            let p = self.parts.first_mut()?;
-            if p.bytes + data.len() + budget_reserve > p.budget { return None; }
+            let p = self.parts.get_mut(d)?;
+            if d == 0 && p.bytes + data.len() + budget_reserve > p.budget { return None; }
             if let Ok((free, _)) = p.be.mem_info() && free < data.len() + free_reserve { return None; }
             let b = p.be.alloc(data.len()).ok()?;
             if p.be.htod(data, &b, 0).is_err() { return None; }
-            p.bytes += data.len();
-            let arc = std::sync::Arc::new(SlabBuf { buf: b, bytes: data.len(), freed: self.freed.clone() });
+            if d == 0 { p.bytes += data.len(); }
+            let arc = std::sync::Arc::new(SlabBuf { buf: b, bytes: data.len(), acct: if d == 0 { data.len() } else { 0 }, freed: self.freed.clone() });
             if let Some(k) = cache_key {
                 self.slabs.retain(|_, v| v.strong_count() > 0);
                 self.slabs.insert(k, std::sync::Arc::downgrade(&arc));
@@ -158,6 +197,14 @@ pub(crate) mod dev {
         /// The GPU that takes `len` more bytes of plain weights: the current one while they fit, then the next; the last takes all.
         pub fn pick(&mut self, len: usize) -> usize {
             self.reclaim();
+            // Local patch (Inkling 2 on several GPUs): the decode state lives on GPU 0 and reads the plain weights
+            // there, so they stay on GPU 0 while the budget has room and the live free VRAM keeps the state reserve.
+            // The state, KV and prefill scratch are allocated outside the budget; `room` alone would move the plain
+            // weights to GPU 1 (it is ~0.4 GB at 0.9), which is what this branch avoids.
+            if self.parts.len() > 1 && self.cur == 0 && plain_first_enabled() {
+                let free = self.parts[0].be.mem_info().map_or(usize::MAX, |m| m.0);
+                if plain_first_fits(self.parts[0].bytes, len, self.parts[0].budget, free) { return 0; }
+            }
             while self.cur + 1 < self.parts.len() && self.parts[self.cur].bytes + len > self.parts[self.cur].room { self.cur += 1; }
             self.cur
         }
@@ -209,7 +256,27 @@ pub(crate) mod dev {
         /// `evict` false: a miss with no free room returns None, so the caller can run that expert on the CPU.
         /// Whether the expert that starts at `data` has a VRAM slot (no lookup is counted).
         pub fn resident(&self, data: &[u8]) -> bool { self.ex.contains_key(&(data.as_ptr() as usize)) }
+        /// The GPU that holds the experts of the stacked tensor at `base` (`len` bytes): picked on first sight as the
+        /// GPU with the smallest share of its expert budget already promised. None with one GPU or
+        /// STRATA_DS_NO_AFFINITY set (the old per-expert choice).
+        fn affinity(&mut self, base: usize, len: usize) -> Option<usize> {
+            let n = self.parts.len();
+            if n < 2 || std::env::var_os("STRATA_DS_NO_AFFINITY").is_some() { return None; }
+            if let Some(&d) = self.aff.get(&base) { return Some(d); }
+            if self.aff_bytes.len() != n { self.aff_bytes = vec![0; n]; }
+            let frac = |d: usize| self.aff_bytes[d] as f64 / self.parts[d].budget.max(1) as f64;
+            let d = (0..n).min_by(|&a, &b| frac(a).total_cmp(&frac(b)))?;
+            self.aff_bytes[d] += len;
+            self.aff.insert(base, d);
+            Some(d)
+        }
+        /// `expert` for an expert that belongs to the stacked tensor (`base`, `len`): see `affinity`.
+        pub fn expert_grouped(&mut self, group: (usize, usize), data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, evict: bool) -> Option<u32> {
+            self.group = Some(group);
+            self.expert(data, ty, rows, cols, scale, evict)
+        }
         pub fn expert(&mut self, data: &[u8], ty: GgmlType, rows: usize, cols: usize, scale: f32, evict: bool) -> Option<u32> {
+            let group = self.group.take();
             self.reclaim();
             let k = data.as_ptr() as usize;
             self.now += 1;
@@ -223,8 +290,14 @@ pub(crate) mod dev {
                 return Some(self.exs[p].0);
             }
             EX_LOOKUPS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Local patch: all experts of one stacked tensor (a layer's gate_up or down) go to the same GPU, so a
+            // layer's matvecs hit `batch_mats`' single-GPU path instead of two sequential batches with two readbacks.
+            // The GPU with the most free budget used to win per expert, which spread every layer over both cards.
+            let pref = group.and_then(|(base, len)| self.affinity(base, len));
             let room = |p: &Part| (p.bytes + data.len() <= p.budget).then(|| p.budget - p.bytes);
-            if let Some(d) = (0..self.parts.len()).filter_map(|d| room(&self.parts[d]).map(|r| (r, d))).max().map(|(_, d)| d) {
+            let pick = pref.filter(|&d| room(&self.parts[d]).is_some())
+                .or_else(|| (0..self.parts.len()).filter_map(|d| room(&self.parts[d]).map(|r| (r, d))).max().map(|(_, d)| d));
+            if let Some(d) = pick {
                 let i = self.upload_on(d, data, ty, rows, cols, scale)?;
                 self.ex.insert(k, self.exs.len());
                 self.exs.push((i, k, now, 1.0));
@@ -341,6 +414,29 @@ pub(crate) mod dev {
             drop(owned);
             Some(y)
         }
+        /// Routed experts with separate gate/up/down matrices in one GPU round trip using `Backend::situ` on device.
+        pub fn situ_experts_split(&self, gs: &[Mat], us: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+            let d = self.part_of(gs.first()?)?;
+            if gs.len() != us.len() || gs.len() != downs.len() { return None; }
+            if gs.iter().chain(us).chain(downs).any(|m| self.part_of(m) != Some(d)) { return None; }
+            let (p, ne, nf, nl) = (&self.parts[d], gs.len(), downs[0].cols, downs[0].rows);
+            if x.len() > p.x.len() / 4 || ne * (2 * nf + nl) > p.y.len() / 4 { return None; }
+            p.be.put(x, &p.x, 0).ok()?;
+            let ((owned, ts), at) = (self.tensors(p, &[gs, us, downs])?, |i: usize| p.y.addr() + (4 * i) as u64);
+            for i in 0..ne {
+                p.be.gemv(&ts[i], p.x.addr(), at(i * 2 * nf)).ok()?;
+                p.be.gemv(&ts[ne + i], p.x.addr(), at(i * 2 * nf + nf)).ok()?;
+            }
+            p.be.situ(p.y.addr(), nf, ne, 0, beta, lb).ok()?;
+            for i in 0..ne {
+                p.be.gemv(&ts[2 * ne + i], at(i * 2 * nf), at(ne * 2 * nf + i * nl)).ok()?;
+            }
+            let y = p.be.get(&p.y, ne * 2 * nf, ne * nl).ok()?;
+            drop(owned);
+            Some(y)
+        }
+        /// Whether `m` lives in VRAM of the first GPU (a staged matrix is copied up to it per use).
+        pub fn on_first(&self, m: &Mat) -> bool { self.part_of(m) == Some(0) }
         fn part_of(&self, m: &Mat) -> Option<usize> {
             let i = m.gpu?;
             Some(if i == STAGED { 0 } else { gpu_of(i) })
@@ -577,7 +673,47 @@ pub(crate) mod dev {
 /// `Mat::matvec`.
 pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
     if let Some(y) = matvec_many_opt(ms, x, xs) { return y; }
+    if xs > 0 && ms.len() > 1 {
+        let slices: Vec<&[f32]> = (0..ms.len()).map(|i| &x[i * xs..i * xs + ms[i].cols]).collect();
+        if let Some(y) = matvec_many_cpu(ms, &slices) { return y; }
+    }
     let mut y = vec![0f32; ms.iter().map(|m| m.rows).sum()];
+    if xs == 0 && ms.len() > 1 && std::env::var_os("STRATA_CPU_REF").is_none() {
+        let mut int_ms: Vec<(usize, usize, Mat, usize, fn(&[u8], &[crate::cpu_moe::Q8K]) -> f32)> = Vec::new();
+        let mut other: Vec<(usize, Mat)> = Vec::new();
+        let (mut off, mut int_total) = (0, 0);
+        for &m in ms {
+            if m.gpu.is_none() && m.cols == x.len() && (m.cpu || m.rows >= 512) && m.cols % m.ty.block_elems() == 0
+                && let Some(dot) = crate::cpu_moe::int_dot(m.ty)
+            {
+                let rb = m.ty.row_bytes(m.cols as u64);
+                int_ms.push((int_total, off, m, rb, dot));
+                int_total += m.rows;
+            } else {
+                other.push((off, m));
+            }
+            off += m.rows;
+        }
+        if int_ms.len() > 1 {
+            let xq = crate::cpu_moe::quantize_q8k(x);
+            let mut tmp = vec![0f32; int_total];
+            tmp.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+                for (k, o) in ys.iter_mut().enumerate() {
+                    let r = c * 32 + k;
+                    let i = int_ms.partition_point(|(s, ..)| *s <= r) - 1;
+                    let (s, _, m, rb, dot) = int_ms[i];
+                    *o = dot(&m.data[(r - s) * rb..(r - s + 1) * rb], &xq) * m.scale;
+                }
+            });
+            for (s, dst_off, m, ..) in &int_ms {
+                y[*dst_off..*dst_off + m.rows].copy_from_slice(&tmp[*s..*s + m.rows]);
+            }
+            for (dst_off, m) in other {
+                m.matvec(x, &mut y[dst_off..dst_off + m.rows]);
+            }
+            return y;
+        }
+    }
     let mut off = 0;
     for (i, m) in ms.iter().enumerate() {
         m.matvec(&x[i * xs..i * xs + m.cols], &mut y[off..off + m.rows]);
@@ -586,27 +722,62 @@ pub fn matvec_many(ms: &[Mat], x: &[f32], xs: usize) -> Vec<f32> {
     y
 }
 
-/// Host integer dot of several matrices, one activation each, in a single Rayon pass: the rows of all matrices, in
-/// order. None when a matrix is on the GPU or `Mat::matvec` would not take the integer dot for it.
-pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
-    let ty = ms.first()?.ty;
-    if ms.len() != xs.len() || ms.iter().any(|m| m.ty != ty || m.gpu.is_some() || m.cols != xs[0].len())
-        || xs.iter().any(|x| x.len() != xs[0].len()) { return None; }
-    if std::env::var_os("STRATA_CPU_REF").is_some() || xs[0].len() % ty.block_elems() != 0
-        || ms.iter().any(|m| !m.cpu && m.rows < 512) { return None; }
-    let dot = crate::cpu_moe::int_dot(ty)?;
-    let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
-    let rb = ty.row_bytes(xs[0].len() as u64);
+/// Host integer dot of several matrices sharing ONE activation `x`, in a single `quantize_q8k` + single Rayon pass.
+/// Supports mixed `GgmlType`s across `ms` as long as every matrix is host-only and has an integer dot kernel.
+pub fn matvec_many_cpu_shared<'a>(ms: &[Mat<'a>], x: &[f32]) -> Option<Vec<f32>> {
+    if ms.is_empty() || std::env::var_os("STRATA_CPU_REF").is_some() { return None; }
+    let cols = x.len();
+    let mut dots = Vec::with_capacity(ms.len());
     let mut starts = Vec::with_capacity(ms.len());
     let mut off = 0;
-    for m in ms { starts.push((off, *m)); off += m.rows; }
+    for m in ms {
+        if m.gpu.is_some() || m.cols != cols || (!m.cpu && m.rows < 512) || cols % m.ty.block_elems() != 0 {
+            return None;
+        }
+        let dot = crate::cpu_moe::int_dot(m.ty)?;
+        let rb = m.ty.row_bytes(cols as u64);
+        starts.push((off, *m, rb));
+        dots.push(dot);
+        off += m.rows;
+    }
+    let xq = crate::cpu_moe::quantize_q8k(x);
     let mut y = vec![0f32; off];
     y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
         for (k, o) in ys.iter_mut().enumerate() {
             let r = c * 32 + k;
-            let i = starts.partition_point(|(s, _)| *s <= r) - 1;
-            let (s, m) = starts[i];
-            *o = dot(&m.data[(r - s) * rb..(r - s + 1) * rb], &xq[i]) * m.scale;
+            let i = starts.partition_point(|(s, ..)| *s <= r) - 1;
+            let (s, m, rb) = starts[i];
+            *o = dots[i](&m.data[(r - s) * rb..(r - s + 1) * rb], &xq) * m.scale;
+        }
+    });
+    Some(y)
+}
+
+/// Host integer dot of several matrices, one activation each, in a single Rayon pass: the rows of all matrices, in
+/// order. Supports mixed `GgmlType`s. None when a matrix is on the GPU or `Mat::matvec` would not take the integer dot.
+pub fn matvec_many_cpu<'a>(ms: &[Mat<'a>], xs: &[&[f32]]) -> Option<Vec<f32>> {
+    if ms.is_empty() || ms.len() != xs.len() || std::env::var_os("STRATA_CPU_REF").is_some() { return None; }
+    let mut dots = Vec::with_capacity(ms.len());
+    let mut starts = Vec::with_capacity(ms.len());
+    let mut off = 0;
+    for (m, x) in ms.iter().zip(xs) {
+        if m.gpu.is_some() || m.cols != x.len() || (!m.cpu && m.rows < 512) || m.cols % m.ty.block_elems() != 0 {
+            return None;
+        }
+        let dot = crate::cpu_moe::int_dot(m.ty)?;
+        let rb = m.ty.row_bytes(m.cols as u64);
+        starts.push((off, *m, rb));
+        dots.push(dot);
+        off += m.rows;
+    }
+    let xq: Vec<_> = xs.par_iter().map(|x| crate::cpu_moe::quantize_q8k(x)).collect();
+    let mut y = vec![0f32; off];
+    y.par_chunks_mut(32).enumerate().for_each(|(c, ys)| {
+        for (k, o) in ys.iter_mut().enumerate() {
+            let r = c * 32 + k;
+            let i = starts.partition_point(|(s, ..)| *s <= r) - 1;
+            let (s, m, rb) = starts[i];
+            *o = dots[i](&m.data[(r - s) * rb..(r - s + 1) * rb], &xq[i]) * m.scale;
         }
     });
     Some(y)
@@ -630,6 +801,9 @@ pub fn swiglu_chunk(gates: &[Mat], ups: &[Mat], downs: &[Mat], pairs: &[Vec<(usi
 }
 pub fn situ_experts(gus: &[Mat], downs: &[Mat], gs: &[f32], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
     dev::get().and_then(|d| d.lock().unwrap().situ_experts(gus, downs, gs, x, beta, lb))
+}
+pub fn situ_experts_split(gs: &[Mat], us: &[Mat], downs: &[Mat], x: &[f32], beta: f32, lb: f32) -> Option<Vec<f32>> {
+    dev::get().and_then(|d| d.lock().unwrap().situ_experts_split(gs, us, downs, x, beta, lb))
 }
 
 /// W x[t] for each row of `xs` (all rows of one matrix). Batches on the GPU when the weight is resident.
@@ -759,6 +933,19 @@ impl<'a> Mat<'a> {
         Ok(Mat { data, ty, rows, cols, cpu, gpu, scale })
     }
 
+    /// Load a tensor strictly on the host mmap (never uploaded to VRAM, e.g. `token_embd.weight` read only via `row_into`).
+    pub fn load_host(g: &'a Gguf, name: &str) -> anyhow::Result<Self> {
+        let t: &TensorInfo = g.tensors.get(name).ok_or_else(|| anyhow::anyhow!("missing tensor {name}"))?;
+        let ty = GgmlType::from_u32(t.ty)?;
+        let cols = t.dims[0] as usize;
+        let rows = t.dims[1..].iter().product::<u64>() as usize;
+        let cpu = name.contains("_exps");
+        let data = g.bytes(t);
+        let scale = name.strip_suffix(".weight").and_then(|stem| g.tensors.get(&format!("{stem}.scale")))
+            .filter(|st| st.ty == 0).and_then(|st| g.bytes(st).try_into().ok()).map_or(1.0, f32::from_le_bytes);
+        Ok(Mat { data, ty, rows, cols, cpu, gpu: None, scale })
+    }
+
     /// Like `load` for a matrix used as `n` row groups (grouped output projection): each group gets its own VRAM copy.
     pub fn load_groups(g: &'a Gguf, name: &str, n: usize) -> anyhow::Result<Self> {
         let mut m = Self::load(g, name)?;
@@ -788,8 +975,15 @@ impl<'a> Mat<'a> {
     /// `expert` that never overwrites a VRAM slot when `evict` is false: an expert that is not resident and has no
     /// free room comes back host-only, for the CPU.
     pub fn expert_opt(&self, e: usize, n_expert: usize, evict: bool) -> Mat<'a> {
+        self.expert_opt_in(e, n_expert, evict, self, 0)
+    }
+
+    /// `expert_opt` where the GPU is chosen per `key` (a layer's gate_up tensor) instead of per tensor, so the gate_up
+    /// and down experts of a layer share a GPU: `extra` is the bytes of the other tensors of the group.
+    pub fn expert_opt_in(&self, e: usize, n_expert: usize, evict: bool, key: &Mat<'a>, extra: usize) -> Mat<'a> {
         let mut m = self.expert_host(e, n_expert);
-        m.gpu = dev::get().and_then(|d| d.lock().unwrap().expert(m.data, m.ty, m.rows, m.cols, m.scale, evict));
+        let group = (key.data.as_ptr() as usize, key.data.len() + extra);
+        m.gpu = dev::get().and_then(|d| d.lock().unwrap().expert_grouped(group, m.data, m.ty, m.rows, m.cols, m.scale, evict));
         m
     }
 
@@ -864,6 +1058,22 @@ impl<'a> Mat<'a> {
                     *o = dot(&self.data[r * rb..(r + 1) * rb], &xq) * sc;
                 }
             });
+            return;
+        }
+        if self.ty == GgmlType::F32 {
+            let calc = |(r, o): (usize, &mut f32)| {
+                let bytes = &self.data[r * rb..(r + 1) * rb];
+                let mut s = 0.0f32;
+                for (chunk, &xv) in bytes.chunks_exact(4).zip(x) {
+                    s += f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) * xv;
+                }
+                *o = s * sc;
+            };
+            if self.rows <= 64 {
+                y.iter_mut().enumerate().for_each(calc);
+            } else {
+                y.par_iter_mut().enumerate().for_each(calc);
+            }
             return;
         }
         let xq = q8_roundtrip(self.ty, self.cpu, x);

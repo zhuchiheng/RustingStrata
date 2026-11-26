@@ -57,7 +57,7 @@ win must not silently double someone's KV cache. `--ctx` and `--kv` only set the
 
 ## Workloads and tasks
 
-`--pp` lists prompt depths (default `128,512,2048`); `--tg` sets decoded tokens (default 128). All depths of one task
+`--pp` lists prompt depths (default `128,512,2048`); `--tg` sets decoded tokens (default 64). All depths of one task
 are measured in a single child process.
 
 - `prose` (default): the built-in repeated paragraph, a stable machine-level baseline.
@@ -90,7 +90,9 @@ The search is deterministic for a given `--seed` and bounded by `--samples`:
 A candidate that fails (OOM, timeout, missing JSON fields) is recorded with its error and never wins; it still counts
 against the budget. Every stage, including the final polish, draws from `--samples`; the baseline alone is outside the
 budget. `--reps N` repetitions happen inside one sample and do not consume extra samples. `--timeout SECS` caps each
-sample. `--warmup N` adds an extra discarded run per sample; it is off by default because it loads the model a second
+sample. `--minutes M` (default 30, 0 = none) caps the whole search: no sample starts after it, and the best point so
+far is written with stop reason `time`. After the baseline, calibrate prints how long it took and the time the whole
+budget would take; each sample prints a progress line. `--warmup N` adds an extra discarded run per sample; it is off by default because it loads the model a second
 time.
 
 ### Knobs
@@ -120,14 +122,15 @@ layer split, and `--split` is ignored with a note.
 | flag | default | meaning |
 | --- | --- | --- |
 | `--samples N` | 24 | hard cap on benchmark samples |
-| `--reps N` | 3 | repetitions per point (their mean is used) |
+| `--reps N` | 2 | repetitions per point (their mean is used) |
 | `--warmup N` | 0 | extra discarded run before each sample |
 | `--pp A,B,C` | `128,512,2048` | prompt depths |
-| `--tg N` | 128 | decoded tokens |
+| `--tg N` | 64 | decoded tokens |
 | `--chunk-values A,B` | `256,…,4096` | prefill chunks to search |
 | `--task LABEL` | `prose` | corpus (repeatable) |
 | `--seed N` | 1 | deterministic search seed |
 | `--timeout SECS` | 0 (none) | per-sample time limit |
+| `--minutes M` | 30 | time limit of the search (0 = none) |
 | `--dry-run` | off | print the plan, take no measurements |
 | `--out DIR` | — | also write the full sample trace |
 | `--mtp-model` / `--draft-model` | — | measure with that draft file loaded |

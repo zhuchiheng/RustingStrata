@@ -74,6 +74,8 @@ const DONE: &str = "<|content_model_end_sampling|>";
 pub fn gpu_defaults() {
     crate::deepseek::chat::gpu_defaults();
     if std::env::var_os("STRATA_DS_GPU_FRACTION").is_none() { unsafe { std::env::set_var("STRATA_DS_GPU_FRACTION", "0.6,0.9") } }
+    // Local patch: with several GPUs the plain weights stay on GPU 0, where the device decode state lives.
+    if std::env::var_os("STRATA_DS_PLAIN_FIRST").is_none() { unsafe { std::env::set_var("STRATA_DS_PLAIN_FIRST", "1") } }
 }
 
 /// The template's `tojson(sort_keys=true, separators=(",", ":"))`.
@@ -246,7 +248,7 @@ pub fn decode_with(
     let id = |t: &str| tok.token_id(t);
     let (model, end) = (id(MODEL), id(END));
     let kinds = [(id(TEXT), Part::Text), (id(THINKING), Part::Think), (id(INVOKE), Part::Call)];
-    let pure_greedy = smp.temp <= 0.0 && smp.repeat == 1.0 && smp.presence == 0.0 && smp.frequency == 0.0 && smp.dry_mult <= 0.0;
+    let pure_greedy = smp.temp <= 0.0 && smp.repeat == 1.0 && smp.presence == 0.0 && smp.frequency == 0.0 && smp.dry_mult <= 0.0 && smp.limit.is_none();
     let pick_tok = |smp: &mut Sampler, l: &[f32]| -> u32 {
         if pure_greedy {
             crate::ops::argmax(l) as u32
@@ -309,6 +311,7 @@ pub fn decode_with(
             }
         }
         i += 1;
+        crate::term::decoded(1);
         if part == Some(Part::Think)
             && thinking_budget > 0
             && think_tokens >= thinking_budget
@@ -329,7 +332,7 @@ pub fn decode_with(
         if i < n {
             if let Some(t) = pending.pop_front() {
                 next = t;
-            } else if m.has_spec() && stops.is_empty() {
+            } else if m.has_spec() && stops.is_empty() && smp.limit.is_none() {
                 let budget_cap = if part == Some(Part::Think) && thinking_budget > 0 {
                     thinking_budget.saturating_sub(think_tokens)
                 } else {
@@ -398,6 +401,7 @@ pub fn generate_image_opts(
     for i in 0..max_gen {
         if eos.contains(&next) { break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out).unwrap_or_default();
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             print!("{}", &s[shown..]);
@@ -525,7 +529,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         ensure!(!ids.is_empty(), "cannot encode prompt");
         ensure!(ids.len() < m.max_ctx, "prompt is {} tokens, the limit is {}", ids.len(), m.max_ctx);
         let t = std::time::Instant::now();
-        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let (keep, logits) = crate::serve::alive(c, q.stream, || if !has_images && m.toks.len() < ids.len() && ids.starts_with(&m.toks) {
             let k = m.toks.len();
             (k, m.prefill_embds(&seq[k..]))
@@ -544,6 +548,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         if let Some(t) = q.temperature { smp.temp = t; }
         if let Some(k) = q.top_k { smp.top_k = k; }
         if let Some(p) = q.top_p { smp.top_p = p; }
+        if let Some(p) = q.min_p { smp.min_p = p; }
         if let Some(p) = q.presence_penalty { smp.presence = p; }
         if let Some(f) = q.frequency_penalty { smp.frequency = f; }
         if let Some(rp) = q.repeat_penalty { smp.repeat = rp; }
@@ -552,6 +557,7 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str, opts: Inkling2O
         if let Some(db) = q.dry_base { smp.dry_base = db; }
         if let Some(da) = q.dry_allowed_length { smp.dry_allowed = da; }
         if let Some(s) = q.seed { smp.rng = s.max(1); }
+        smp.limit = crate::grammar::Constraint::new(q, tok)?;
 
         let budget = q.thinking_budget.unwrap_or(opts.thinking_budget);
         let n = q.max_tokens.unwrap_or(usize::MAX).min(m.max_ctx - m.toks.len());

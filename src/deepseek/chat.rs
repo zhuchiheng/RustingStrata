@@ -21,6 +21,7 @@ pub fn generate(g: &Gguf, prompt: &str, n: usize) -> anyhow::Result<()> {
         let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
         if eos.contains(&next) { break; }
         out.push(next);
+        crate::term::decoded(1);
         let s = tok.decode(&out)?;
         if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
             print!("{}", &s[shown..]);
@@ -65,6 +66,7 @@ pub fn chat(g: &Gguf, system: Option<String>, n: usize, think: bool) -> anyhow::
             let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
             if eos.contains(&next) { break; }
             out.push(next);
+            crate::term::decoded(1);
             let s = tok.decode(&out)?;
             if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
                 print!("{}", &s[shown..]);
@@ -97,11 +99,12 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
     let eos = tok.eos_ids();
     let ctx = ctx_limit(g);
     Ok(Box::new(move |c: &mut std::net::TcpStream, q: &crate::serve::ChatRequest| {
+        let mut lim = crate::grammar::Constraint::new(q, tok)?;
         let ids = tok.encode(&Template::Ds.render(&q.messages, &q.tools, q.think.unwrap_or(false), q.preserve_thinking.unwrap_or(true), true)).ok().filter(|i| !i.is_empty()).context("cannot encode prompt")?;
         anyhow::ensure!(ids.len() <= ctx, "prompt is {} tokens, the limit is {ctx}", ids.len());
         let t = std::time::Instant::now();
         let keep = if m.toks.len() < ids.len() && ids.starts_with(&m.toks) { m.toks.len() } else { m.reset(); 0 };
-        if q.stream { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
+        if q.stream && !q.head_sent { let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"); }
         let mut logits = crate::serve::alive(c, q.stream, || m.prefill(&ids[keep..]));
         let prefill_s = t.elapsed().as_secs_f64();
         let n = q.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len());
@@ -111,9 +114,10 @@ pub fn serve<'a>(g: &'a Gguf, tok: &'a Tokenizer, name: &'a str) -> anyhow::Resu
         let (mut out, mut shown, mut done) = (vec![], 0, "length");
         let mut alive = std::time::Instant::now();
         for i in 0..n {
-            let next = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            let next = crate::grammar::greedy(&mut lim, &mut logits);
             if eos.contains(&next) { done = "stop"; break; }
             out.push(next);
+            crate::term::decoded(1);
             let s = tok.decode(&out).unwrap_or_default();
             if !s.ends_with('\u{FFFD}') && s.len() > shown && s.is_char_boundary(shown) {
                 let t = hold.push(&s[shown..]);

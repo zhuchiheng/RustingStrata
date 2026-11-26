@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod host_attn;
 pub mod term;
 pub mod calibrate;
 
@@ -15,6 +16,7 @@ pub mod gguf;
 pub mod quant;
 pub mod weights;
 pub mod ops;
+pub mod grammar;
 pub mod tokenizer;
 pub mod model;
 pub mod backend;
@@ -29,6 +31,7 @@ pub mod serve;
 pub mod chat;
 pub mod vision;
 pub mod hf;
+pub mod update;
 pub mod mcp;
 pub mod deepseek;
 pub mod gemma4;
@@ -37,3 +40,5 @@ pub mod hy4;
 pub mod kolibri;
 pub mod inkling2;
 pub mod ngram;
+pub mod raon;
+pub mod kv_turbo;

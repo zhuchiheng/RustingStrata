@@ -84,7 +84,7 @@ pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend
             Ok(g) => Ok(Box::new(g)),
             Err(c) if format!("{c}") == "CUDA init" => {
                 let v = crate::vulkan::Vk::new(device).map_err(|v| anyhow::anyhow!("no GPU backend loads: CUDA: {c:#}; Vulkan: {v:#}"))?;
-                eprintln!("CUDA unavailable ({c:#}), using Vulkan");
+                crate::say!("CUDA unavailable ({c:#}), using Vulkan");
                 Ok(Box::new(v))
             }
             Err(c) => Err(c),
@@ -127,6 +127,12 @@ pub trait Backend: Send {
     }
     /// Zeroed buffer of `bytes` (at least 1).
     fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
+    /// Zeroed buffer of `bytes` in host RAM the device reads over PCIe (CUDA: mapped pinned memory). Backends
+    /// without it fall back to device memory.
+    fn alloc_host(&self, bytes: usize) -> anyhow::Result<Buf> { self.alloc(bytes) }
+    /// Decode attention of `nt` tokens over a host-RAM cache (`alloc_host`) computed on the CPU, written to `out`
+    /// with the output gate `qg` applied. Ok(false): not supported here, use `attn_decode_q`.
+    fn attn_host(&self, _q: u64, _kc: u64, _vc: u64, _qg: u64, _out: u64, _step: u64, _nh: usize, _nkv: usize, _hd: usize, _scale: f32, _nt: usize) -> anyhow::Result<bool> { Ok(false) }
     fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()>;
     fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()>;
@@ -170,6 +176,10 @@ pub trait Backend: Send {
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;
+    /// Host memory of `bytes` that `dtod`, `get` and `put` reach, for state the device copies in and out rarely (the
+    /// saved state of each `--parallel` slot), so that it takes RAM instead of VRAM. `None` where the backend has
+    /// none; the caller then allocates VRAM.
+    fn host_buf(&self, _bytes: usize) -> anyhow::Result<Option<Buf>> { Ok(None) }
 
     /// Refuse, before any weight is uploaded, if a pipeline these weight types (`GpuModel`'s upload types) need would
     /// exceed the device's shared-memory limit; `verbose` also lists each checked (kernel, specialization) pair.
@@ -201,8 +211,11 @@ pub trait Backend: Send {
         Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale))
     }
 
-    /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
+    /// u16 words of a KV cache row for `n` values in the K format (and, separately, the V format).
+    /// `kv_row_words` is the size of one K row plus one V row.
     fn kv_words(&self, n: usize) -> usize;
+    fn kv_words_v(&self, n: usize) -> usize { self.kv_words(n) }
+    fn kv_row_words(&self, n: usize) -> usize { self.kv_words(n) + self.kv_words_v(n) }
     /// GEMM over a tile list: for each tile, positions m0 .. m0 + cnt get y[m, 0..rows] = W_tile x[xrow[m]] (x row m
     /// when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32]. `act`: 0 stores, 1 computes
     /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y; `| SAME_X` as below. `n_x`: rows of x
@@ -341,6 +354,10 @@ pub trait Backend: Send {
     fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
         self.ink_clip_n(x, scale, w, rows, 1, thr, eps, mul, dst, 0, 1, 0, 0.0, 1.0)
     }
+    /// Like `ink_clip`, for a V cache.
+    fn ink_clip_v(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
+        self.ink_clip_n_v(x, scale, w, rows, 1, thr, eps, mul, dst, 0, 1, 0, 0.0, 1.0)
+    }
     /// Batched `ink_clip` over `nt` tokens of `rows` rows each (`x`: `[nt][rows][w]`, `scale`: `[rows][w]` or 0).
     /// When `dst != 0`, stores token `tok` at KV row `(dst_at0 + tok) % dst_ring`. When `log_alpha != 0.0`,
     /// scales `mul` by `1 + log_alpha * ln(max((pos0 + tok + 1) / log_floor, 1))`.
@@ -352,6 +369,15 @@ pub trait Backend: Send {
     ) -> anyhow::Result<()> {
         anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
     }
+    /// Like `ink_clip_n`, for a V cache. Backends with one format for both halves treat it identically.
+    fn ink_clip_n_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_at0: usize, dst_ring: usize,
+        pos0: usize, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        self.ink_clip_n(x, scale, w, rows, nt, thr, eps, mul, dst, dst_at0, dst_ring, pos0, log_alpha, log_floor)
+    }
     /// Graph-capturable `ink_clip_n`: reads `pos0` from device `i32` pointer `pos_ptr` (`dst_at0 = pos0 % dst_ring`).
     fn ink_clip_pos(
         &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
@@ -360,6 +386,15 @@ pub trait Backend: Send {
         _pos_ptr: u64, _log_alpha: f32, _log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Like `ink_clip_pos`, for a V cache.
+    fn ink_clip_pos_v(
+        &self, x: u64, scale: u64, w: usize, rows: usize, nt: usize,
+        thr: f32, eps: f32, mul: f32,
+        dst: u64, dst_ring: usize,
+        pos_ptr: u64, log_alpha: f32, log_floor: f32,
+    ) -> anyhow::Result<()> {
+        self.ink_clip_pos(x, scale, w, rows, nt, thr, eps, mul, dst, dst_ring, pos_ptr, log_alpha, log_floor)
     }
     /// Attention of one token over `rows` key and value rows (`nkv * hd` wide in active KV format; the token's own row is `at`, the
     /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a

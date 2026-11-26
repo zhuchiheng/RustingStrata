@@ -17,17 +17,56 @@ pub(crate) const QTYPES: [GgmlType; 29] = {
     use GgmlType::*;
     [F32, BF16, F8E4M3, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, IQ1S, IQ1M, IQ2XXS, IQ2XS, IQ2S, IQ3XXS, IQ3S, IQ4XS, IQ4NL, Q2_0, TQ1_0, TQ2_0, TQ2T, TQK6, TQK7, Q4_1, Q5_1, Q4_0, Q5_0, NVFP4]
 };
-pub(crate) const KERNELS: [&str; 58] = [
-    "rope_freq", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
-    "kv_store", "attn_merge", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
+pub(crate) const KERNELS: [&str; 68] = [
+    "rope_freq", "rope_cs", "qsa_pool", "qsa_score", "qsa_select", "rms_norm", "quant_xq", "argmax_part", "argmax_rows", "l2_norm", "rope_neox", "rms_norm_rope", "add", "swiglu", "situ", "situ_q", "softcap", "swiglu_q", "ssm_gates", "conv_silu", "deltanet_seq", "norm_gate",
+    "kv_store", "kv_store_turbo", "attn_merge", "ha_post", "ha_wait", "router_topk", "moe_combine", "moe_route", "conv_seq", "conv_state",
     "moe_combine_seq", "moe_prefetch", "attn_prefill_64", "attn_prefill_128", "attn_prefill_256", "quant_q8",
     "hc_silu", "hc_mix", "hc_write", "ple_gate", "ple_conv", "dflash2_conv", "hadamard",
-    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_merge",
-    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel",
+    "ink_mix", "ink_ctrl_gate", "ink_ctrl_out", "ink_ctrl_gate_b", "ink_ctrl_out_b", "ink_conv", "ink_conv_batch", "ink_clip", "ink_attn", "ink_attn_128", "ink_attn_merge",
+    "ink_attn_prefill_32", "ink_attn_prefill_64", "ink_attn_prefill_128", "ink_attn_prefill_128_old", "ink_attn_prefill_128_kp", "ink_attn_prefill_128_kp16", "ink_attn_prefill_sh_32", "ink_attn_prefill_sh_64", "ink_attn_prefill_sh_128", "ink_ffn_sum", "ink_route", "attn_sel",
 ];
 
 pub use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, GEMM_BM, GpuTensor};
 use crate::backend::ATT_SPLITS_1;
+
+/// Kernel-choice flags read from the environment once, when the `Gpu` is made: they sit on the token path, so a
+/// lookup per launch is not worth it.
+#[derive(Clone, Copy)]
+struct InkFlags {
+    /// `STRATA_DS_FAST_KERNELS=auto` (default) uses the tiled controllers, `ink_attn_128` and `kp16` only when
+    /// the run has more than one device; `1` forces them on, `0` forces the old kernels. One card keeps the
+    /// `main` kernels (the greedy output must not change).
+    fast: bool,
+    /// `STRATA_CTRL_TILE=0` forces the per-token `ink_ctrl_*` pair; unset follows `fast`.
+    ctrl_tile: bool,
+    /// `STRATA_DS_ATTN_OLD=1` keeps the scalar/one-query-a-warp attention kernels for a measurement window.
+    attn_old: bool,
+    /// `STRATA_DS_ATTN_KP4=1` selects the four-query 128-key tile prefill kernel.
+    attn_kp4: bool,
+}
+
+impl InkFlags {
+    fn from_parts(fast: Option<&str>, multi: bool, ctrl: Option<&str>, attn_old: Option<&str>, attn_kp4: Option<&str>) -> Self {
+        let on = |v: Option<&str>, default: bool| v.map_or(default, |v| v != "0");
+        let fast = match fast {
+            None | Some("auto") => multi,
+            Some("0") => false,
+            Some(_) => true,
+        };
+        Self { fast, ctrl_tile: on(ctrl, fast), attn_old: on(attn_old, false), attn_kp4: on(attn_kp4, false) }
+    }
+    fn from_env() -> Self {
+        let multi = std::env::var("STRATA_DS_DEVICES")
+            .map_or(false, |v| v.split(',').filter(|d| !d.trim().is_empty()).count() > 1);
+        Self::from_parts(
+            std::env::var("STRATA_DS_FAST_KERNELS").ok().as_deref(),
+            multi,
+            std::env::var("STRATA_CTRL_TILE").ok().as_deref(),
+            std::env::var("STRATA_DS_ATTN_OLD").ok().as_deref(),
+            std::env::var("STRATA_DS_ATTN_KP4").ok().as_deref(),
+        )
+    }
+}
 
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
@@ -45,8 +84,13 @@ pub struct Gpu {
     /// `gemmd_*` scratch for a GEMM that two blocks share the columns of: a slot per stream (see `GEMMD_SLOT`),
     /// allocated by the first such GEMM.
     gd: std::sync::OnceLock<CudaSlice<u8>>,
-    /// The kernels were compiled for KV cache mode (0 = f16, 1 = q8, 2 = q4).
+    /// The kernels were compiled for these independent K and V cache modes; `kv_mode` is the symmetric view
+    /// (`kv_mode()`: the shared mode, 10 for mixed K/V).
     pub kv_mode: u32,
+    pub kv_k_mode: u32,
+    pub kv_v_mode: u32,
+    /// The environment's kernel-choice flags, read once at creation.
+    flags: InkFlags,
     /// The GPU has int8 tensor-core mma (sm_80+). Turing runs the prefill GEMM on the f16 path instead.
     pub int8_mma: bool,
     /// sm_75: m16n8k8 mma, 64 KB of shared memory a block (no int8 mma, unlike sm_80+; unlike sm_70 it has no m8n8k4).
@@ -66,6 +110,8 @@ pub struct Gpu {
     lag: std::sync::Mutex<Option<CudaEvent>>,
     /// rope_freq tables by (base bits, n_rot), and the ones a graph capture asked for (see `rope_fr`).
     fr: std::sync::Mutex<(HashMap<(u32, usize), CudaSlice<f64>>, Vec<(f32, usize)>)>,
+    /// rope_cs scratch (ROPE_CS (sin, cos) pairs), allocated with the first rope_freq table.
+    cs: std::sync::OnceLock<CudaSlice<f32>>,
 }
 
 const RING: usize = 64 << 20;
@@ -75,10 +121,11 @@ const RING_MIN: usize = 256 << 10;
 /// `nb` inside `beside`: launches stay on the main stream, copies go to the side stream.
 const BESIDE: usize = usize::MAX - 1;
 /// `gemmd_*` splits the columns of a matrix of at most this many rows between two blocks. Measured on an RTX 3060
-/// with Qwen3-4B: the 9728-row FFN matrices gain at 8 and 16 positions and are level at 64; the output head (151936
-/// rows) fills the card without the split.
+/// with Qwen3-4B: the 9728-row FFN matrices gain at 8 and 16 positions and lose 9% at 64 (split only up to half as
+/// many rows there); the output head (151936 rows) fills the card without the split.
 const GEMMD_SPLIT_ROWS: usize = 16384;
 /// A scratch slot of `gemmd_*`: a count per 128 rows, then the partial sums of both blocks for 64 positions.
+const ROPE_CS: usize = 1 << 17;
 const GEMMD_SLOT: usize = GEMMD_SPLIT_ROWS / 128 * 4 + 2 * 64 * GEMMD_SPLIT_ROWS * 4;
 
 /// A recorded graph. Its handles are plain CUDA driver handles, which any thread may launch once the context is
@@ -92,19 +139,60 @@ unsafe impl Send for Graph {}
 /// and run attention as its CPU flash attention does (LLAMA_Q8 in kernels.cu).
 pub fn llama_numerics() -> bool { std::env::var_os("STRATA_LLAMA_NUMERICS").is_some() }
 
-/// KV cache mode (`0 = f16`, `1 = q8`, `2 = q4`, `3 = q2`): read once by Gpu::new and Vk::new.
-pub fn kv_mode() -> u32 {
-    if let Ok(v) = std::env::var("STRATA_KV") {
-        if v == "q2" { return 3; }
-        if v == "q4" { return 2; }
-        if v == "q8" { return 1; }
-        return 0;
+/// Independent per-side cache modes: `0 = f16`, `1 = q8`, `2 = q4`, `3 = q2`,
+/// `4 = turbo4`, `5 = turbo3`, `6 = turbo2`. The K and V halves may differ.
+fn parse_kv_mode(s: &str) -> u32 {
+    match s {
+        "q2" => 3, "q4" => 2, "q8" => 1,
+        "turbo4" | "turboquant" => 4,
+        "turbo3" => 5,
+        "turbo2" => 6,
+        _ => 0,
+    }
+}
+
+pub fn kv_k_mode() -> u32 {
+    if let Ok(s) = std::env::var("STRATA_KV_K") { return parse_kv_mode(&s); }
+    if let Ok(s) = std::env::var("STRATA_KV") {
+        return match s.as_str() {
+            "turbo4-3" | "turbo4v3" => 4, "turbo4-2" | "turbo4v2" => 4,
+            "turbo3-2" | "turbo3v2" => 5,
+            other => parse_kv_mode(other),
+        };
     }
     u32::from(std::env::var_os("STRATA_KV_Q8").is_some())
 }
 
+pub fn kv_v_mode() -> u32 {
+    if let Ok(s) = std::env::var("STRATA_KV_V") { return parse_kv_mode(&s); }
+    if let Ok(s) = std::env::var("STRATA_KV") {
+        return match s.as_str() {
+            "turbo4-3" | "turbo4v3" => 5, "turbo4-2" | "turbo4v2" => 6,
+            "turbo3-2" | "turbo3v2" => 6,
+            other => parse_kv_mode(other),
+        };
+    }
+    u32::from(std::env::var_os("STRATA_KV_Q8").is_some())
+}
+
+/// Legacy symmetric view: the shared mode when K and V match, 10 for a mixed layout.
+/// Callers that only care about "is the cache quantized at all" keep working.
+pub fn kv_mode() -> u32 {
+    let (k, v) = (kv_k_mode(), kv_v_mode());
+    if k == v { k } else { 10 }
+}
+
+/// u16 words a cache row of `n` values occupies in mode `m`.
+fn kv_mode_words(m: u32, n: usize) -> usize {
+    match m { 1 => n * 17 / 32, 2 | 4..=6 => n * 9 / 32, 3 => n * 3 / 16, _ => n }
+}
+
 /// `--kv q8`: KV cache rows in ggml q8_0 form (`kv_mode() == 1`).
 pub fn kv_q8() -> bool { kv_mode() == 1 }
+
+/// Backends without per-side K/V formats only handle a symmetric legacy layout. `kv_mode()` reports 10 for a
+/// mixed layout, which would otherwise pass a `<= 3` guard and reach an `unreachable!` in the size helpers.
+pub fn kv_legacy_symmetric(k: u32, v: u32) -> bool { k == v && k <= 3 }
 
 /// `STRATA_GEMM_FMA`: force the CUDA-core FMA fallback in the f16 prefill kernels instead of the sm_70 tensor-core
 /// path (`GEMM_TC` in kernels.cu). It covers both the f16 prefill GEMM and the prefill attention (`attn_prefill_t`):
@@ -175,9 +263,10 @@ pub(crate) fn gemv_block_from(global: Option<&str>, family: Option<&str>) -> u32
         .unwrap_or(256)
 }
 
-fn source(kv_mode: u32, gemm_tc: bool) -> String { source_with(kv_mode, gemm_tc, Tune::from_env()) }
+fn source(k_mode: u32, v_mode: u32, gemm_tc: bool) -> String { source_with(k_mode, v_mode, gemm_tc, Tune::from_env()) }
 
-fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
+fn source_with(k_mode: u32, v_mode: u32, gemm_tc: bool, tune: Tune) -> String {
+    let tq_bits = |m: u32| match m { 5 => 3, 6 => 2, _ => 4 };
     let join = |v: Vec<String>| v.join(",");
     format!(
         "__device__ const unsigned long long iq2xs_grid[512] = {{{}}};\n\
@@ -189,7 +278,7 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
          __device__ const unsigned char ksigns_iq2xs[128] = {{{}}};\n\
          __device__ const signed char kvalues_iq4nl[16] = {{{}}};\n\
          __device__ const float tq_lut[4096] = {{{}}};\n\
-         #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define GEMM_TC {}\n\
+          #define LLAMA_Q8 {}\n#define KV_MODE {}\n#define K_MODE {}\n#define V_MODE {}\n#define TQ_KBITS {}\n#define TQ_VBITS {}\n#define GEMM_TC {}\n\
          #define GEMM_BM {}\n#define GEMM_BK {}\n#define GEMM_MIN_BLOCKS {}\n#define GEMV_LOADW {}\n\
          #define FA_BQ {}\n#define FA_BK {}\n{}",
         join(IQ2XS_GRID.iter().map(|v| format!("{v:#x}ULL")).collect()),
@@ -202,7 +291,11 @@ fn source_with(kv_mode: u32, gemm_tc: bool, tune: Tune) -> String {
         join(KVALUES_IQ4NL.iter().map(|v| v.to_string()).collect()),
         join(crate::quant::TQ_LUT.iter().flatten().map(|v| format!("{v:e}f")).collect()),
         llama_numerics() as u8,
-        kv_mode as u8,
+        k_mode as u8,  // legacy KV_MODE alias: the K half, for code not yet split
+        k_mode as u8,
+        v_mode as u8,
+        tq_bits(k_mode),
+        tq_bits(v_mode),
         gemm_tc as u8,
         GEMM_BM,
         tune.gemm_bk,
@@ -366,7 +459,7 @@ fn smem_log(family: &str, optin: usize, stat: usize, set: Option<usize>, carveou
 
 /// The kernel names to load from the cubin: the full list on sm_80+, without the int8 GEMM (`gemmi_*`, `gemmis_*` and
 /// `gemmd_*`, 23 non-float types x 3 fewer names) on a device where that code is not compiled in. Pure so a CPU test can pin
-/// both lists (393 / 324 names).
+/// both lists (394 / 325 names).
 pub(crate) fn kernel_names(sm80: bool) -> Vec<String> {
     let int8 = move |&&t: &&GgmlType| sm80 && !t.float_x();
     KERNELS.iter().map(|s| s.to_string())
@@ -440,6 +533,14 @@ pub fn cfg(grid: (u32, u32), block: u32, smem: u32) -> LaunchConfig {
 /// otherwise) names the kernel that raised it. Debugging only: no graphs, and every launch pays a stream sync.
 static SYNC_EACH: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("STRATA_CUDA_SYNC").is_some());
 
+/// `attn_host`: tokens and floats a token (nh * (hd + 2)) its mapped staging holds; queries, partials and positions,
+/// shared by all layers (the stream runs them in turn), never freed since captured graphs keep their addresses.
+const HA_T: usize = 64;
+const HA_W: usize = 64 * 514;
+/// Queries, partials, positions, the mailbox (mapped) and the sequence counter (device).
+static HA_STAGE: std::sync::Mutex<Option<(Buf, Buf, Buf, Buf, Buf)>> = std::sync::Mutex::new(None);
+static CTX: std::sync::Mutex<Vec<(u64, u64, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
 macro_rules! launch {
     ($g:expr, $name:expr, $cfg:expr, $($a:expr),* $(,)?) => {{
         let f = $g.f($name);
@@ -451,6 +552,10 @@ macro_rules! launch {
         }
     }};
 }
+
+/// rms_norm_rope's block: 128 threads for a head of 128 or less (the threads past n held 0 for block_sum, so the bits
+/// are the same), else 256.
+fn nr_block(n: usize) -> u32 { if n <= 128 { 128 } else { 256 } }
 
 pub(crate) fn kname(prefix: &str, ty: GgmlType) -> String { format!("{prefix}_{}", ty.name().to_lowercase()) }
 
@@ -472,8 +577,8 @@ pub fn device_uuids() -> Vec<Option<[u8; 16]>> {
 
 impl Gpu {
     pub fn new(device: usize) -> anyhow::Result<Gpu> {
-        let kv_mode = kv_mode();
-        anyhow::ensure!(!(kv_mode > 0 && llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
+        let (kv_k_mode, kv_v_mode) = (kv_k_mode(), kv_v_mode());
+        anyhow::ensure!(!((kv_k_mode > 0 || kv_v_mode > 0) && llama_numerics()), "--kv q8/q4 does not combine with --llama-numerics (its attention reads f16 KV)");
         if !unsafe { sys::is_culib_present() } {
             return Err(anyhow::anyhow!(if cfg!(windows) { "no NVIDIA driver (nvcuda.dll)" } else { "no NVIDIA driver (libcuda.so)" })).context("CUDA init");
         }
@@ -491,7 +596,7 @@ impl Gpu {
         let gemm_fma = gemm_fma();
         crate::say!("{}", device_log(device, &ctx.name().unwrap_or_default(), arch, (maj, min), gemm_fma));
         let stream = ctx.new_stream()?;
-        let module = ctx.load_module(ptx(&source(kv_mode, !gemm_fma && (maj, min) < (7, 5)), arch, (maj, min))?).context("load cubin")?;
+        let module = ctx.load_module(ptx(&source(kv_k_mode, kv_v_mode, !gemm_fma && (maj, min) < (7, 5)), arch, (maj, min))?).context("load cubin")?;
         let i8_gemm = int8_gemm_arch((maj, min));
         let turing = !int8_mma && (maj, min) >= (7, 5);
         // The per-block dynamic shared memory ceiling the driver reports: 96 KiB on Volta per the roadmap, but
@@ -532,7 +637,7 @@ impl Gpu {
         let am = stream.alloc_zeros(64 * AMAX_PARTS)?;
         let ring = std::sync::Mutex::new((unsafe { ctx.alloc_pinned::<u8>(RING)? }, 0, VecDeque::new()));
         let done = ctx.new_event(None)?;
-        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode, int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default() })
+        Ok(Gpu { ctx, side: stream.fork()?, stream, nb: AtomicUsize::new(usize::MAX), fns, i8_gemm, q8, gd: Default::default(), kv_mode: if kv_k_mode == kv_v_mode { kv_k_mode } else { 10 }, kv_k_mode, kv_v_mode, flags: InkFlags::from_env(), int8_mma, turing, max_smem: max_optin, am, graphs: Default::default(), ring, done, lag: Default::default(), fr: Default::default(), cs: Default::default() })
     }
 
     fn f(&self, name: &str) -> &CudaFunction { &self.fns[name] }
@@ -553,9 +658,21 @@ impl Gpu {
         let (bs, nr) = (base, n_rot as i32);
         b.arg(&p); b.arg(&bs); b.arg(&nr);
         unsafe { b.launch(cfg((1, 1), 256, 0)) }.context("launch rope_freq")?;
+        if self.cs.get().is_none() { let _ = self.cs.set(self.stream.alloc_zeros::<f32>(2 * ROPE_CS)?); }
         self.stream.synchronize()?;
         fr.0.insert((base.to_bits(), n_rot), t);
         Ok(p)
+    }
+
+    /// The rope_cs table of nt tokens (positions as rms_norm_rope reads them), or 0 (the kernel computes them itself):
+    /// no fr table yet, too many tokens, or inside `batch` (two streams would share the scratch).
+    fn rope_cs(&self, step: u64, kvt: u64, nt: usize, n_rot: usize, fr: u64) -> anyhow::Result<u64> {
+        let n = nt * (n_rot / 2);
+        let Some(cs) = self.cs.get() else { return Ok(0) };
+        if fr == 0 || n == 0 || n > ROPE_CS || self.nb.load(Relaxed) != usize::MAX { return Ok(0); }
+        let cs = self.ptr(cs);
+        launch!(self, "rope_cs", cfg((n.div_ceil(256) as u32, 1), 256, 0), cs, step, kvt, nt as i32, n_rot as i32, fr);
+        Ok(cs)
     }
 
     /// The stream for the next launch: inside `batch`, odd launches go to `side`.
@@ -626,7 +743,7 @@ impl Gpu {
         if batched && tiles == 0 && xrow == 0 && nd <= 64 {
             let pb = nd.next_power_of_two().max(8);
             let xw = if pb >= 32 { 128 } else { 4096 / pb };  // GEMMD_XW
-            let ks = if rows <= GEMMD_SPLIT_ROWS && cols >= 2 * xw { 2 } else { 1 };
+            let ks = if rows <= if nd > 32 { GEMMD_SPLIT_ROWS / 2 } else { GEMMD_SPLIT_ROWS } && cols >= 2 * xw { 2 } else { 1 };
             // The launches of a stream run in order, so each stream has a slot (`st`: the odd launches of a batch go to `side`).
             let n = self.nb.load(Relaxed);
             if self.gd.get().is_none() { let _ = self.gd.set(self.stream.alloc_zeros(2 * GEMMD_SLOT)?); }
@@ -760,7 +877,7 @@ impl Gpu {
         // attn_decode_gqa with the f16 cache at head_dim 128 or 256 also holds 2 chunks of K and V for its cp.async,
         // attn_decode_gqa4_128 one. Turing (sm_75) has 64 KB of shared memory a block: the head_dim 256 chunks do
         // not fit, so it loads them through registers instead (kernels.cu ATT_RUN_CP).
-        let cp = self.kv_mode == 0 && (hd == 128 || (hd == 256 && self.int8_mma));
+        let cp = self.kv_k_mode == 0 && self.kv_v_mode == 0 && (hd == 128 || (hd == 256 && self.int8_mma));
         let g4 = cp && g == 4 && hd == 128;
         let (name, cp) = if g4 { ("attn_decode_gqa4_128".to_string(), 2 * 32 * hd * 2) } else { (format!("attn_decode_gqa_{hd}"), if cp { 2 * 2 * 32 * hd * 2 } else { 0 }) };
         if gq_min != i32::MAX { launch!(self, &name, cfg(((nh / g * nt) as u32, ns as u32), 256, (8 * hd * 4 + cp) as u32), q, kc, vc, part, step, nh as i32, nkv as i32, hd as i32, scale, gq_min, pz, nt as i32, sel, sst as i32, sink, win as i32, kvt); }
@@ -778,6 +895,16 @@ impl Gpu {
             for _ in 0..256 { std::hint::spin_loop(); }
         }
         Ok(())
+    }
+}
+
+impl Gpu {
+    /// The decode attention entry point and its key positions per block: the f16 head_dim 128 kernel scores a
+    /// 128-key tile a block, the scalar one 64 keys (`STRATA_DS_ATTN_OLD=1` keeps it for a measurement window;
+    /// the flag is cached in `flags` at `Gpu` creation). The 128-key kernel keeps the relative-bias row in 32
+    /// shared floats, so a wider `nr` uses the scalar kernel.
+    pub(crate) fn ink_attn_kernel(&self, hd: usize, nr: usize) -> (&'static str, usize) {
+        if hd == 128 && nr <= 32 && self.kv_mode == 0 && self.flags.fast && !self.flags.attn_old { ("ink_attn_128", 128) } else { ("ink_attn", 64) }
     }
 }
 
@@ -799,6 +926,9 @@ impl Backend for Gpu {
             q8,
             gd: Default::default(),
             kv_mode: self.kv_mode,
+            flags: self.flags,
+            kv_k_mode: self.kv_k_mode,
+            kv_v_mode: self.kv_v_mode,
             int8_mma: self.int8_mma,
             turing: self.turing,
             max_smem: self.max_smem,
@@ -808,6 +938,7 @@ impl Backend for Gpu {
             done,
             lag: Default::default(),
             fr: Default::default(),
+            cs: Default::default(),
         }))
     }
     /// The type policy gated on this device: `gemm_raw` takes the f16 `gemm_*` path where the arch has no int8
@@ -928,7 +1059,84 @@ impl Backend for Gpu {
         Ok(())
     }
 
+    fn alloc_host(&self, bytes: usize) -> anyhow::Result<Buf> {
+        // Anonymous memory on 2 MB huge pages (the CPU attention walks it all each token: 4 KB pages cost ~30% in
+        // TLB misses), then pinned and mapped into the device with cuMemHostRegister.
+        struct Reg(#[allow(dead_code)] memmap2::MmapMut, usize);
+        impl Drop for Reg { fn drop(&mut self) { unsafe { let _ = sys::cuMemHostUnregister(self.1 as *mut _); } } }
+        const HP: usize = 2 << 20;
+        let len = bytes.max(1).next_multiple_of(HP);
+        let mut m = memmap2::MmapMut::map_anon(len + HP)?;
+        #[cfg(target_os = "linux")]
+        let _ = m.advise(memmap2::Advice::HugePage);
+        let base = m.as_mut_ptr() as usize;
+        let h = base.next_multiple_of(HP);
+        unsafe { std::ptr::write_bytes(h as *mut u8, 0, len) };
+        self.ctx.bind_to_thread()?;
+        let r = unsafe { sys::cuMemHostRegister_v2(h as *mut _, len, sys::CU_MEMHOSTREGISTER_DEVICEMAP | sys::CU_MEMHOSTREGISTER_PORTABLE) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuMemHostRegister: {r:?}");
+        // From here a failure drops `reg`, which unregisters the range before the mapping goes.
+        let reg = Reg(m, h);
+        let mut dev = 0;
+        let r = unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, h as *mut _, 0) };
+        anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuMemHostGetDevicePointer: {r:?}");
+        anyhow::ensure!(dev == h as u64, "mapped host memory has a device address other than its host one (no UVA)");
+        let b = Buf::new(dev, bytes, reg);
+        // The staging of `attn_host`, made here at load time: allocating inside a graph capture breaks it.
+        let mut st = HA_STAGE.lock().unwrap();
+        if st.is_none() {
+            let raw = |n: usize| -> anyhow::Result<Buf> { let (b, _) = self.host_mailbox(n.div_ceil(4))?; Ok(b) };
+            let (mb, host) = self.host_mailbox(64)?;
+            *st = Some((raw(4 * HA_T * HA_W)?, raw(4 * HA_T * HA_W)?, raw(8 * HA_T)?, mb, self.alloc(64)?));
+            if std::env::var_os("STRATA_HA_MAILBOX").is_some() { crate::host_attn::start_worker(host as usize); }
+        }
+        Ok(b)
+    }
+
+    fn attn_host(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<bool> {
+        if self.kv_mode > 2 || nt > HA_T || hd % 32 != 0 || nh % nkv != 0 || nh * (hd + 2) > HA_W { return Ok(false); }
+        let st = HA_STAGE.lock().unwrap();
+        let Some((bq, bp, bs, mb, seq)) = st.as_ref() else { return Ok(false) };
+        let (bq, bp, bs, mb, seq) = (bq.addr(), bp.addr(), bs.addr(), mb.addr(), seq.addr());
+        drop(st);
+        let ctx = {
+            let mut c = CTX.lock().unwrap();
+            // Keyed by every field: a model loaded later can reuse a freed cache's addresses with other shapes.
+            let same = |a: &crate::host_attn::HostAttn| a.kc == kc as usize && a.vc == vc as usize && a.nt == nt && a.nh == nh
+                && a.nkv == nkv && a.hd == hd && a.mode == self.kv_mode as u32 && a.scale.to_bits() == scale.to_bits();
+            match c.iter().find(|e| same(unsafe { &*(e.3 as *const crate::host_attn::HostAttn) })) {
+                Some(e) => e.3,
+                None => {
+                    let a = Box::leak(Box::new(crate::host_attn::HostAttn { q: bq as usize, step: bs as usize, part: bp as usize,
+                        kc: kc as usize, vc: vc as usize, nh, nkv, hd, nt, scale, mode: self.kv_mode as u32 })) as *mut _ as usize;
+                    c.push((kc, vc, nt, a));
+                    a
+                }
+            }
+        };
+        // A stream host function by default; `STRATA_HA_MAILBOX` spins on a mapped flag instead (measured the same,
+        // 14.6 vs 14.7 tok/s at 52K, and a dead worker would trap the GPU).
+        if std::env::var_os("STRATA_HA_MAILBOX").is_none() {
+            self.ctx.bind_to_thread()?;
+            let cs = self.st().cu_stream();
+            unsafe {
+                result::memcpy_dtod_async(bq, q, 4 * nt * nh * hd, cs)?;
+                result::memcpy_dtod_async(bs, step, 8 * nt, cs)?;
+                let r = sys::cuLaunchHostFunc(cs, Some(crate::host_attn::callback), ctx as *mut _);
+                anyhow::ensure!(r == sys::CUresult::CUDA_SUCCESS, "cuLaunchHostFunc: {r:?}");
+            }
+        } else {
+            launch!(self, "ha_post", cfg((1, 1), 256, 0), q, step, bq, bs, (nt * nh * hd) as i32, (2 * nt) as i32, mb, seq, ctx as u64);
+            launch!(self, "ha_wait", cfg((1, 1), 32, 0), mb, seq);
+        }
+        launch!(self, "attn_merge", LaunchConfig { grid_dim: (nh as u32, 1, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 },
+                bp, qg, out, hd as i32, 1i32, step, 1i32, 0i32, 0u64, 0u64);
+        Ok(true)
+    }
+
     /// Pinned host memory mapped into the device address space.
+    fn host_buf(&self, bytes: usize) -> anyhow::Result<Option<Buf>> { Ok(Some(self.host_mailbox(bytes.div_ceil(4))?.0)) }
+
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
         let n = words.max(1);
         let flags = sys::CU_MEMHOSTALLOC_DEVICEMAP | sys::CU_MEMHOSTALLOC_PORTABLE;
@@ -1049,8 +1257,9 @@ impl Backend for Gpu {
     fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
-        launch!(self, "rms_norm_rope", cfg((rows as u32, 1), 256, 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
-                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64);
+        let cs = self.rope_cs(step, 0, rows / per, n_rot, fr)?;
+        launch!(self, "rms_norm_rope", cfg((rows as u32, 1), nr_block(n), 0), x, x_stride as i32, w, out, n as i32, eps, per as i32, n_rot as i32, step, base, v, kc, vc,
+                0i32, 0u64, 0i32, 0u64, 0u64, 0i32, fr, 0u64, cs);
         Ok(())
     }
 
@@ -1059,8 +1268,9 @@ impl Backend for Gpu {
                         n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= n.min(512) && n % 32 == 0, "rms_norm_rope: head of {n}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
-        launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), 256, 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
-                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64);
+        let cs = self.rope_cs(step, 0, krows / kper, n_rot, fr)?;
+        launch!(self, "rms_norm_rope", cfg(((qrows + krows) as u32, 1), nr_block(n), 0), k, n as i32, kw, ko, n as i32, eps, kper as i32, n_rot as i32, step, base, v, kc, vc,
+                qrows as i32, q, q_stride as i32, qw, qo, qper as i32, fr, 0u64, cs);
         Ok(())
     }
 
@@ -1070,8 +1280,9 @@ impl Backend for Gpu {
                              step: u64, base: f32, v: u64, kvt: u64, nt: usize) -> anyhow::Result<()> {
         anyhow::ensure!(n_rot <= hd.min(512) && hd % 32 == 0, "rms_norm_rope: head of {hd}, n_rot {n_rot}");
         let fr = self.rope_fr(base, n_rot)?;
-        launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), 256, 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32, step, base, v, 0u64, 0u64,
-                (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt);
+        let cs = self.rope_cs(step, kvt, nt, n_rot, fr)?;
+        launch!(self, "rms_norm_rope", cfg(((nt * (nh + nkv)) as u32, 1), nr_block(hd), 0), k, hd as i32, kw, ko, hd as i32, eps, nkv as i32, n_rot as i32, step, base, v, 0u64, 0u64,
+                (nt * nh) as i32, q, q_stride as i32, qw, qo, nh as i32, fr, kvt, cs);
         Ok(())
     }
 
@@ -1106,6 +1317,18 @@ impl Backend for Gpu {
         Ok(())
     }
     fn ink_ctrl_n(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize, nt: usize) -> anyhow::Result<()> {
+        // A prompt chunk uses the tiled pair (a weight row is read once per 64 tokens); a decoded token the
+        // per-token pair, which has no tile to reuse. Both pairs read and write the same gate layout.
+        // STRATA_CTRL_TILE=0 forces the per-token pair, to compare the two on the same text (the flag is cached
+        // in `flags` at `Gpu` creation).
+        let tiled = nt >= 64 && rank <= 64 && n % 64 == 0 && self.flags.ctrl_tile;
+        if tiled {
+            let g1 = cfg((count as u32, nt.div_ceil(64) as u32), 256, 0);
+            let g2 = LaunchConfig { grid_dim: (count as u32, n.div_ceil(64) as u32, nt.div_ceil(64) as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            launch!(self, "ink_ctrl_gate_b", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
+            launch!(self, "ink_ctrl_out_b", g2, gain, forget, gate, cur, nins as i32, msg, out, n as i32, rank as i32, nt as i32);
+            return Ok(());
+        }
         let g1 = LaunchConfig { grid_dim: (rank as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         let g2 = LaunchConfig { grid_dim: (n.div_ceil(256) as u32, count as u32, nt as u32), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         launch!(self, "ink_ctrl_gate", g1, down, cur, nins as i32, msg, gate, n as i32, rank as i32, nt as i32);
@@ -1130,7 +1353,7 @@ impl Backend for Gpu {
         pos0: usize, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(w <= 128, "ink_clip_n: w={w} > 128");
-        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
+        anyhow::ensure!(self.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_n: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
@@ -1144,7 +1367,7 @@ impl Backend for Gpu {
         pos_ptr: u64, log_alpha: f32, log_floor: f32,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(w <= 128, "ink_clip_pos: w={w} > 128");
-        anyhow::ensure!(kv_mode() == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
+        anyhow::ensure!(self.kv_mode == 0 || dst == 0 || w % 32 == 0, "ink_clip_pos: quantized KV requires w % 32 == 0 (got {w})");
         let ring = if dst != 0 { dst_ring.max(1) } else { 1 };
         let fl = if log_alpha == 0.0 && log_floor == 0.0 { 1.0 } else { log_floor };
         launch!(self, "ink_clip", cfg((rows as u32, nt as u32), 128, 0),
@@ -1152,14 +1375,16 @@ impl Backend for Gpu {
         Ok(())
     }
     fn ink_attn(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, rows: usize, at: usize, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
-        let chunks = rows.div_ceil(64) as u32;
-        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
+        let chunks = rows.div_ceil(ck) as u32;
+        launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, rows as i32, at as i32, 1i32, nkv as i32, hd as i32, nr as i32, ext as i32, 0u64);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
         Ok(())
     }
     fn ink_attn_pos(&self, q: u64, r: u64, sink: u64, gate: u64, k: u64, v: u64, bias: u64, sc: u64, out: u64, max_rows: usize, ring: usize, pos_ptr: u64, nh: usize, nkv: usize, hd: usize, nr: usize, ext: usize) -> anyhow::Result<()> {
-        let chunks = max_rows.div_ceil(64) as u32;
-        launch!(self, "ink_attn", cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
+        let (kn, ck) = self.ink_attn_kernel(hd, nr);
+        let chunks = max_rows.div_ceil(ck) as u32;
+        launch!(self, kn, cfg((nh as u32, chunks), 128, 0), q, r, sink, k, v, bias, sc, 0i32, 0i32, ring.max(1) as i32, nkv as i32, hd as i32, nr as i32, ext as i32, pos_ptr);
         launch!(self, "ink_attn_merge", cfg((nh as u32, 1), 128, 0), sc, gate, out, chunks as i32, hd as i32);
         Ok(())
     }
@@ -1169,7 +1394,19 @@ impl Backend for Gpu {
     ) -> anyhow::Result<()> {
         anyhow::ensure!(matches!(hd, 32 | 64 | 128), "ink_attn_prefill: unsupported hd={hd}");
         let g = nh / nkv.max(1);
-        if win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
+        if hd == 128 && self.kv_mode == 0 && (self.flags.fast || self.flags.attn_kp4) && !self.flags.attn_old {
+            // The key-parallel kernels: kp16 (16 queries a block) by default, kp (4) for the A/B. The wrapper
+            // falls back to the four-query template for a relative-bias width it cannot read as float4.
+            let (kn, qb) = if self.flags.attn_kp4 { ("ink_attn_prefill_128_kp", 4) } else { ("ink_attn_prefill_128_kp16", 16) };
+            launch!(self, kn, cfg((nt.div_ceil(qb) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        } else if hd == 128 && self.flags.attn_old {
+            launch!(self, "ink_attn_prefill_128_old", cfg((nt.div_ceil(4) as u32, nh as u32), 128, 0),
+                q, r, sink, gate, kc, vc, kc_new, vc_new, bias, out,
+                pos as i32, nt as i32, nh as i32, nkv as i32, nr as i32, ext as i32, ring.max(1) as i32, win as i32);
+        // The shared-memory variant reads a legacy f16 layout and has no WHT; TurboQuant uses the grouped kernel.
+        } else if self.kv_mode == 0 && win == 0 && nkv > 0 && nh % nkv == 0 && g <= 4 {
             // Every key: a block is one K/V head and `tb` tokens, with 32 keys of K and V in shared memory.
             let tb = (32 / g).min(8);
             launch!(self, &format!("ink_attn_prefill_sh_{hd}"), cfg((nt.div_ceil(tb) as u32, nkv as u32), (32 * tb * g) as u32, (2 * 32 * hd * 4) as u32),
@@ -1309,14 +1546,19 @@ impl Backend for Gpu {
         Ok(())
     }
 
-    fn kv_words(&self, n: usize) -> usize {
-        match self.kv_mode { 0 => n, 1 => n * 17 / 32, 2 => n * 9 / 32, 3 => n * 3 / 16, _ => unreachable!() }
-    }
+    fn kv_words(&self, n: usize) -> usize { kv_mode_words(self.kv_k_mode, n) }
+    fn kv_words_v(&self, n: usize) -> usize { kv_mode_words(self.kv_v_mode, n) }
 
     fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()> {
         // q8/q4: each warp quantizes one 32-value block of one row.
-        anyhow::ensure!(self.kv_mode == 0 || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
-        launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
+        anyhow::ensure!((self.kv_k_mode == 0 && self.kv_v_mode == 0) || (hd % 32 == 0 && n % hd == 0), "quantized KV cache: head_dim {hd} is not a multiple of 32");
+        if self.kv_k_mode >= 4 || self.kv_v_mode >= 4 {
+            anyhow::ensure!(hd % 128 == 0, "TurboQuant KV needs head_dim divisible by 128, got {hd}");
+            launch!(self, "kv_store_turbo", cfg(((n * t / 128) as u32, 1), 128, 0),
+                k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
+        } else {
+            launch!(self, "kv_store", Self::grid(n * t), k, v, kc, vc, n as i32, (n * t) as i32, step, hd as i32);
+        }
         Ok(())
     }
 
@@ -1417,16 +1659,16 @@ mod tests {
                 return;
             }
         }
-        let src = super::source(0, true);
+        let src = super::source(0, 0, true);
         super::nvrtc::cubin(&src, "sm_70").unwrap_or_else(|e| panic!("sm_70 must compile: M1-T4 removed the last blocker: {e:#}"));
         super::nvrtc::cubin(&src, "sm_80").expect("the sm_80 path must keep compiling (cubin for sm_80)");
         // Same sm_70 source with the FMA fallback selected: both variants must produce a cubin (M2-T1).
-        super::nvrtc::cubin(&super::source(0, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
+        super::nvrtc::cubin(&super::source(0, 0, false), "sm_70").expect("the STRATA_GEMM_FMA sm_70 source must compile");
         // M2-T3 candidates C2 (`__launch_bounds__(·, 2)`) and C3 (`GEMM_BK = 32`) must compile before the window.
-        let c23 = super::source_with(0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
+        let c23 = super::source_with(0, 0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         super::nvrtc::cubin(&c23, "sm_70").expect("the C2/C3 candidate tiles must compile for sm_70");
         // M2-T5 load-width candidate: one 16-byte Q4_K header load in the GEMV path must compile for both arches.
-        let lw = super::source_with(0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        let lw = super::source_with(0, 0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
         super::nvrtc::cubin(&lw, "sm_70").expect("the GEMV_LOADW candidate must compile for sm_70");
         super::nvrtc::cubin(&lw, "sm_80").expect("the GEMV_LOADW candidate must compile for sm_80");
     }
@@ -1435,10 +1677,11 @@ mod tests {
     #[test]
     fn nvrtc_compiles_full_source_for_sm75() {
         if !super::nvrtc::present() { return; }
-        super::nvrtc::cubin(&super::source(0, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
-        super::nvrtc::cubin(&super::source(1, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
-        super::nvrtc::cubin(&super::source(2, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q4 must compile: {e:#}"));
-        super::nvrtc::cubin(&super::source(3, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q2 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(0, 0, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(1, 1, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q8 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(2, 2, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q4 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(3, 3, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_q2 must compile: {e:#}"));
+        super::nvrtc::cubin(&super::source(4, 4, false), "sm_75").unwrap_or_else(|e| panic!("sm_75 kv_turbo4 must compile: {e:#}"));
     }
 
     #[test]
@@ -1523,6 +1766,16 @@ mod tests {
             "cuda device 0: NVIDIA GeForce RTX 3060, sm_86");
     }
 
+    /// CPU-only: a backend that has one format for both halves must reject a mixed layout before its size helpers.
+    #[test]
+    fn legacy_symmetric_kv() {
+        for m in 0..=3 { assert!(super::kv_legacy_symmetric(m, m), "mode {m}"); }
+        assert!(!super::kv_legacy_symmetric(0, 1));
+        assert!(!super::kv_legacy_symmetric(2, 0));
+        assert!(!super::kv_legacy_symmetric(4, 4));
+        assert!(!super::kv_legacy_symmetric(10, 10));
+    }
+
     /// M1-T5, CPU-only: the int8 prefill GEMM needs int8 tensor cores, which Volta (7.x) lacks; every sm_80+ part
     /// keeps it.
     #[test]
@@ -1535,12 +1788,12 @@ mod tests {
     }
 
     /// M1-T5, CPU-only: the loaded name list drops `gemmi_*`/`gemmis_*` only on a device where kernels.cu compiles
-    /// them out. 397 names today (sm_80); 23 non-float types x 3 fewer names = 328 on sm_70.
+    /// them out. 407 names today (sm_80); 23 non-float types x 3 fewer names = 338 on sm_70.
     #[test]
     fn kernel_names() {
         let (sm70, sm80) = (super::kernel_names(false), super::kernel_names(true));
-        assert_eq!(sm80.len(), 397);
-        assert_eq!(sm70.len(), 328);
+        assert_eq!(sm80.len(), 407);
+        assert_eq!(sm70.len(), 338);
         assert!(sm70.iter().all(|n| !n.starts_with("gemmi") && !n.starts_with("gemmd")),
             "sm_70 must not load the int8 prefill GEMM: {:?}",
             sm70.iter().filter(|n| n.starts_with("gemmi")).collect::<Vec<_>>());
@@ -1612,17 +1865,17 @@ mod tests {
     /// kernel; the C2/C3 window candidates only change the injected values.
     #[test]
     fn source_injects_tiles() {
-        let src = super::source_with(0, true, super::Tune::def());
+        let src = super::source_with(0, 0, true, super::Tune::def());
         for define in [
             "#define GEMM_BM 128", "#define GEMM_BK 64", "#define GEMM_MIN_BLOCKS 1", "#define GEMV_LOADW 0",
             "#define FA_BQ 64", "#define FA_BK 32",
         ] {
             assert!(src.contains(define), "source is missing `{define}`");
         }
-        let c23 = super::source_with(0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
+        let c23 = super::source_with(0, 0, true, super::Tune { gemm_bk: 32, gemm_min_blocks: 2, ..super::Tune::def() });
         assert!(c23.contains("#define GEMM_BK 32"));
         assert!(c23.contains("#define GEMM_MIN_BLOCKS 2"));
-        let lw = super::source_with(0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
+        let lw = super::source_with(0, 0, true, super::Tune { gemv_loadw: 1, ..super::Tune::def() });
         assert!(lw.contains("#define GEMV_LOADW 1"));
     }
 
@@ -1716,5 +1969,27 @@ mod tests {
             "cuda shared memory: opt-in 98304 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout 82%");
         assert_eq!(super::smem_log("attn_decode_*", 98304, 2112, None, None),
             "cuda shared memory: opt-in 98304 B per block, attn_decode_*: 2112 B static, dynamic max default (48 KiB), carveout default");
+    }
+
+    /// `STRATA_CTRL_TILE` is read as text: unset or any value but "0" keeps the tiled `ink_ctrl_*` pair. The
+    /// attention flags are plain presence checks and must pass through unchanged.
+    #[test]
+    fn ink_flags_parse_ctrl_tile() {
+        // One card: the default is the old kernels (greedy output must match main).
+        let one = super::InkFlags::from_parts(None, false, None, None, None);
+        assert!(!one.fast && !one.ctrl_tile && !one.attn_old && !one.attn_kp4);
+        // Two cards: `auto` turns the fast kernels on.
+        let two = super::InkFlags::from_parts(None, true, None, None, None);
+        assert!(two.fast && two.ctrl_tile && !two.attn_old && !two.attn_kp4);
+        // Explicit opt-in/opt-out and per-kernel overrides.
+        assert!(super::InkFlags::from_parts(Some("1"), false, None, None, None).fast);
+        assert!(!super::InkFlags::from_parts(Some("0"), true, None, None, None).fast);
+        assert!(!super::InkFlags::from_parts(None, true, Some("0"), None, None).ctrl_tile);
+        let old = super::InkFlags::from_parts(None, true, None, Some("1"), None);
+        assert!(old.attn_old && !old.attn_kp4);
+        let kp4 = super::InkFlags::from_parts(None, true, None, None, Some("1"));
+        assert!(kp4.attn_kp4 && !kp4.attn_old);
+        let off = super::InkFlags::from_parts(None, true, Some("0"), Some("0"), Some("0"));
+        assert!(!off.ctrl_tile && !off.attn_old && !off.attn_kp4);
     }
 }

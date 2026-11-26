@@ -10,7 +10,7 @@ Supported models: Qwen3, Qwen3-Next, Qwen3.5/3.6, Qwen3.8-Flash-Next, Recursive 
 GLM-5.3-Flash, Hy4-flash, Inkling 2 Mini and Kolibri 1.1. The architectures, the GGUF types and the notes for each model are in
 [docs/MODELS.md](docs/MODELS.md).
 
-Version 1.3.2.
+Version 1.3.7.
 
 ## Numbers
 
@@ -24,17 +24,53 @@ file. Neither file fits in VRAM.
 | UD-Q2_K_XL (11.7 GiB), decode after a 4K prompt | **113.4 tok/s** | 66.5 |
 | UD-Q2_K_XL, prefill of a 4K prompt | 2216 tok/s | ~2236 |
 
+### Many users at once
+
+`serve --parallel N` decodes the requests together in one batched forward (CUDA). Same machine, same load script
+(`tools/loadtest.py`: N streamed chats at once, 128 reply tokens each, greedy), total decode tok/s:
+
+| Clients | Qwen3-4B, RustingStrata (Q4_K_M) | Qwen3-4B, vLLM 0.33 (bf16) | Qwen3.6-35B-A3B UD-Q5_K_M, RustingStrata |
+|---:|---:|---:|---:|
+| 1 | 91.3 | 36.7 | 49.0 |
+| 4 | 228.1 | 139.9 | 88.9 |
+| 16 | 799.0 | 520.1 | 100.7 |
+| 64 | 1698 | 1688-1765 | 129.3 |
+
+vLLM runs bf16 weights and RustingStrata Q4_K_M, so the dense columns are not like for like. The 27 GB MoE file does
+not fit on the 12 GB card, so vLLM was not run on it. RustingStrata reads each expert once for all requests of a step,
+runs the experts that are not in VRAM on the CPU, and keeps slot state that does not fit in VRAM in RAM. The MoE
+column moves by about 30% between runs on this machine (the 27 GB file is read through a 30 GB page cache).
+
 The method, the ranges, Vulkan, the other models and the quality checks are in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Install
 
-Download a binary for Linux or Windows from the [releases page](https://github.com/RustingStudio/RustingStrata/releases),
-or build it (Rust 2024 edition; on Windows install the Visual Studio C++ Build Tools first):
+Windows (PowerShell; installs to `%LOCALAPPDATA%\Programs\RustingStrata`, adds it to PATH and makes a Start menu
+entry that opens the chat page):
+
+```powershell
+irm https://raw.githubusercontent.com/RustingStudio/RustingStrata/main/install.ps1 | iex
+```
+
+Linux x86_64 (installs to `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/RustingStudio/RustingStrata/main/install.sh | sh
+```
+
+Arch Linux: `yay -S rustingstrata-bin` (AUR). Or download a binary from the
+[releases page](https://github.com/RustingStudio/RustingStrata/releases), or build it (Rust 2024 edition; on Windows
+install the Visual Studio C++ Build Tools first):
 
 ```sh
 cargo build --release    # the binary is target/release/rustingstrata
 ```
+
+Then `rustingstrata serve --gpu --open` opens the chat page, which downloads models, and `rustingstrata interface`
+asks a few questions in the terminal. `rustingstrata update` replaces the binary with the newest release (`--check`
+only says whether one is out); `serve` prints a line at start when a newer release is out. A binary installed by a
+package manager (the AUR package) is updated with that package manager.
 
 A GPU run needs one of:
 
@@ -88,6 +124,7 @@ Inkling 2 open the GPU by themselves.
 - [HOSTING.md](docs/HOSTING.md): running a server for other people.
 - [SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md) and [AMD.md](docs/AMD.md): the GPUs tried so far and AMD notes.
 - [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
+- [ROADMAP.md](ROADMAP.md): what is planned next, by section; ideas from users are welcome.
 
 ## Development
 
