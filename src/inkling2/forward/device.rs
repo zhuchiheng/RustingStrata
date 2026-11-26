@@ -44,13 +44,15 @@ struct DSlot { k: Buf, v: Buf, hist: Buf, cap: usize }
 /// prompt chunk on, a prefill scratch. The activations come over the host once per layer run (about 10 KB per token).
 struct Remote { part: usize, scr: Buf, s: Scratch, pf: Option<PrefillScratch> }
 
-/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 256 on one card, 512 on two or more;
-/// at most 2048).
+/// Tokens of one prompt chunk on the device: `STRATA_DS_PF_TOKENS` (default 1024; at most 2048).
+///
+/// A chunk is the number of positions one routed expert sees at once, which is what the int8 prefill GEMM's rate
+/// follows: on an RX 7900 XTX at pp 2048 the same prompt ran 900 tok/s at 256, 1127 at 512, 1252 at 1024 and 1351 at
+/// 2048, with byte-identical output. A chunk of 256 puts 40 % of the expert tiles at eight positions or fewer, where
+/// the GEMM reaches a quarter of its rate. The prefill scratch grows by about 190 KB a token: 49 MB at 256, 197 MB at
+/// 1024. Set `STRATA_DS_PF_TOKENS=256` on a card where the extra ~150 MB does not fit, and 2048 for another 8 %.
 pub(super) fn pf_tokens() -> usize {
-    let multi = std::env::var("STRATA_DS_DEVICES")
-        .map_or(false, |v| v.split(',').filter(|d| !d.trim().is_empty()).count() > 1);
-    let default = if multi { 512 } else { 256 };
-    std::env::var("STRATA_DS_PF_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default).clamp(1, 2048)
+    std::env::var("STRATA_DS_PF_TOKENS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024).clamp(1, 2048)
 }
 
 /// Device addresses of the regions of the decode scratch buffer (`sc` lives in `Device::sc_buf` so `--ctx` scales dynamically).
@@ -1443,12 +1445,17 @@ impl Device {
             let mut inv: Vec<i32> = vec![0i32; nt * k];
             let mut gsc_rows: Vec<f32> = if ml.gu_scale.is_empty() { Vec::new() } else { Vec::with_capacity(np) };
             let mut m0 = 0usize;
+            // STRATA_TILE_HIST: how many positions each expert tile really carries. `--chunk` did not move the
+            // prefill rate, so this is the measurement that says whether the tiles are the ones the GEMM wants.
+            let hist = std::env::var_os("STRATA_TILE_HIST").is_some();
+            let mut cnts: Vec<u64> = Vec::new();
             for e in 0..c.n_expert {
                 if by_e[e].is_empty() { continue; }
                 let wg = fe.gu.addr() + (e * fe.gu_stride) as u64;
                 let wd = fe.dn.addr() + (e * fe.dn_stride) as u64;
                 for at in (0..by_e[e].len()).step_by(GEMM_BM) {
                     let cnt = GEMM_BM.min(by_e[e].len() - at) as u64;
+                    if hist { cnts.push(cnt); }
                     tiles_gu.extend([wg, (m0 + at) as u64 | (cnt << 32)]);
                     tiles_dn.extend([wd, (m0 + at) as u64 | (cnt << 32)]);
                 }
@@ -1460,6 +1467,12 @@ impl Device {
                 m0 += by_e[e].len();
             }
             let n_tiles = tiles_gu.len() / 2;
+            if hist {
+                let mut b = [0usize; 7];
+                for &c in &cnts { b[match c { 0..=8 => 0, 9..=16 => 1, 17..=32 => 2, 33..=64 => 3, 65..=96 => 4, 97..=128 => 5, _ => 6 }] += 1; }
+                eprintln!("tile hist: nt={nt} k={k} tiles={} | <=8 {} <=16 {} <=32 {} <=64 {} <=96 {} <=128 {} >128 {}",
+                    cnts.len(), b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
+            }
             let dn_off = 8 * tiles_gu.len();
             let xr_off = dn_off + 8 * tiles_dn.len();
             let inv_off = xr_off + 4 * np;
