@@ -45,9 +45,11 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemm_fs", include_bytes!("spv/gemm_fs.spv")),
     ("gemmi", include_bytes!("spv/gemmi.spv")),
     ("gemmi_16", include_bytes!("spv/gemmi_16.spv")),
+    ("gemmi_16_nb", include_bytes!("spv/gemmi_16_nb.spv")),
     ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
     ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
     ("gemmi_s_16", include_bytes!("spv/gemmi_s_16.spv")),
+    ("gemmi_s_16_nb", include_bytes!("spv/gemmi_s_16_nb.spv")),
     ("gemv_f", include_bytes!("spv/gemv_f.spv")),
     ("gemv_q", include_bytes!("spv/gemv_q.spv")),
     ("hadamard", include_bytes!("spv/hadamard.spv")),
@@ -198,6 +200,9 @@ struct Inner {
     /// `maxComputeSharedMemorySize` of the device (or STRATA_VK_SMEM_LIMIT, a test hook): no pipeline may need more
     /// `Workgroup` bytes than this (`Vk::pipeline`), or the driver accepts it and faults at dispatch (Xid 13 on Volta).
     smem_limit: u32,
+    /// `STRATA_VK_GEMM_NB`: run the int8 prefill GEMM from the single-stage `gemmi_*_nb` kernels (less shared memory
+    /// per workgroup, so more workgroups per CU, at two barriers per step instead of one).
+    gemm_nb: bool,
     /// Nanoseconds per GPU timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
     ts_period: f32,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
@@ -515,7 +520,7 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, gemm_nb: std::env::var_os("STRATA_VK_GEMM_NB").is_some(), ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -1047,7 +1052,12 @@ impl Vk {
         if !same { q8.1 = None; }
         let xq = self.q8_x(&mut q8, ty, cols, n_x, x, x_stride)?.expect("int8 GEMM without a quantized x");
         let args: [&dyn Arg; 11] = [&tiles, &wd, &xq, &xrow, &y, &(nd as u32), &(y_stride as u32), tail[0], tail[1], tail[2], tail[3]];
-        let (gk, gks) = match self.0.coop_i8 { 32 => ("gemmi", "gemmi_s"), 16 => ("gemmi_16", "gemmi_s_16"), _ => ("gemmi_dp", "gemmi_dp") };
+        let (gk, gks) = match self.0.coop_i8 {
+            // STRATA_VK_GEMM_NB: the single-stage gemmi variants (less shared memory, two barriers per step).
+            32 => ("gemmi", "gemmi_s"),
+            16 => if self.0.gemm_nb { ("gemmi_16_nb", "gemmi_s_16_nb") } else { ("gemmi_16", "gemmi_s_16") },
+            _ => ("gemmi_dp", "gemmi_dp"),
+        };
         self.run(if self.0.coop_i8 == 0 { "gemmi_dp" } else if sm { gks } else { gk }, &spec, grid, &args)?;
         if self.0.coop_i8 != 0 && tiles != 0 { self.run(gks, &spec, grid, &args)?; }
         Ok(())

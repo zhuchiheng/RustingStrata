@@ -34,9 +34,17 @@ const uint KS = T == 42 || T == 34 || T == 35 || T == 2 || T == 3 || T == 6 || T
 // On RDNA 3/3.5 (COOP_K 16), 16x16x16 coopmat consumes KS = 16 directly without padding (PW = 20).
 const uint PX = 20, PW = (COOP != 0 && COOP_K == 16) || KS == 32 ? 20 : 36;
 const uint WS = PW == 20 ? 4 : 8;
-// X and W are double buffered: step kb + 1 is stored while step kb's products run, so one barrier per step.
-shared uint xq[2 * XM * PX], wq[2 * 64 * PW];
-shared float xd[2][XM][2], xsum[2][XM][4], wsc[2][64][4], wmn[2][64][4];
+// NB 1 (gemmi_*_nb): one X and one W stage instead of two, so the shared use fits two or three workgroups per CU
+// (gemmi_16 asks 40960 bytes, one workgroup of a 48 KB CU; the tb variant asks less). Each step is then loaded after
+// the previous step's products, with two barriers per step instead of one: a measurement, not the default.
+#ifndef NB
+#define NB 0
+#endif
+const uint NBUF = NB != 0 ? 1 : 2;
+// The 512 words of the coopmat row and column index matrices sit after X's stages.
+const uint XQW = NB != 0 ? XM * PX + 512 : 2 * XM * PX;
+shared uint xq[XQW], wq[NBUF * 64 * PW];
+shared float xd[NBUF][XM][2], xsum[NBUF][XM][4], wsc[NBUF][64][4], wmn[NBUF][64][4];
 // The int32 sums start at I2F_BIAS, so a sum c is held as I2F_BIAS + c: for |c| < 2^22 its float is then the
 // bits minus 2^23 + 2^22, without the quarter-rate I2F (i2f_small in kernels.cu).
 const int I2F_BIAS = 0x4B400000;
@@ -100,7 +108,7 @@ void main() {
     const uint IX = XM * PX;
     for (uint i = tid; i < 256; i += 256) { xq[IX + i] = i / 16; xq[IX + 256 + i] = i % 16; }
 #endif
-    if (PW == 36) for (uint i = tid; i < 2 * 64 * PW; i += 256) wq[i] = 0;
+    if (PW == 36) for (uint i = tid; i < NBUF * 64 * PW; i += 256) wq[i] = 0;
     load_tables();
     barrier();
     // Subgroup w multiplies rows bm .. bm + 31 by columns bn .. bn + 31 of the tile, or with sm (at most 32 positions,
@@ -137,10 +145,14 @@ void main() {
     [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * WS + j] = wv[j];
     wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
     for (uint kb = 0; kb < p.nk; kb++) {
-        uint xb = kb & 1;
+        uint xb = NB != 0 ? 0u : (kb & 1u);
         barrier();
+#if NB
+        // One stage: step kb is already in it (stored before the loop, or at the end of step kb - 1).
+#else
         if (kb + 1 < p.nk && xr < XM) ldx(xr, xh, xok, xo, cols, kb + 1, xb ^ 1);
         if (kb + 1 < p.nk) ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
+#endif
         // Expert tiles are often part full; a subgroup whose 32 positions are all past cnt has nothing to multiply.
         if (bm < cnt)
         [[unroll]] for (uint h = 0; h < 64 / KS; h++) {
@@ -218,10 +230,20 @@ void main() {
 #endif
                 }
         }
+        #if NB
+        if (kb + 1 < p.nk) {
+            barrier();
+            if (xr < XM) ldx(xr, xh, xok, xo, cols, kb + 1, 0u);
+            ldw(wt, wr, wi, wok, n0, kb + 1, wv, d, m);
+            [[unroll]] for (uint j = 0; j < 4; j++) wq[wr * PW + wi * WS + j] = wv[j];
+            wsc[0][wr][wi] = d; wmn[0][wr][wi] = m;
+        }
+#else
         if (kb + 1 < p.nk) {
             [[unroll]] for (uint j = 0; j < 4; j++) wq[((xb ^ 1) * 64 + wr) * PW + wi * WS + j] = wv[j];
             wsc[xb ^ 1][wr][wi] = d; wmn[xb ^ 1][wr][wi] = m;
         }
+#endif
     }
     [[unroll]] for (uint mt = 0; mt < 2; mt++)
         [[unroll]] for (uint nt = 0; nt < 2; nt++)
