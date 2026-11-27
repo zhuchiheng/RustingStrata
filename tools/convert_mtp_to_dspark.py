@@ -24,6 +24,7 @@ Everything is written as F32 (the drafter is small, 0.6 GiB in BF16) so no quant
 matched at load; Strata's Mat reads F32 fine.
 """
 import json
+import os
 import struct
 import sys
 from pathlib import Path
@@ -114,6 +115,28 @@ def kv_uint32_array(k, vals):
     return out + b"".join(struct.pack("<I", v) for v in vals)
 
 
+GGML_Q8_0 = 8
+
+
+def q8_0_row(row):
+    """One row of f32 as GGML Q8_0: blocks of 32 values, an f16 scale then 32 int8 (34 bytes a block).
+
+    d = amax / 127 and the codes round to nearest, which is what the dequantizer in src/quant/mod.rs reads back.
+    A row whose length is not a multiple of 32 cannot be written this way; the caller keeps it F32.
+    """
+    import numpy as np
+    v = np.asarray(row, dtype=np.float32).reshape(-1, 32)
+    amax = np.abs(v).max(axis=1)
+    d = (amax / 127.0).astype(np.float16)
+    inv = np.where(amax > 0, 127.0 / np.where(amax > 0, amax, 1.0), 0.0).astype(np.float32)
+    q = np.clip(np.rint(v * inv[:, None]), -127, 127).astype(np.int8)
+    out = bytearray()
+    for b in range(v.shape[0]):
+        out += d[b].tobytes()
+        out += q[b].tobytes()
+    return bytes(out)
+
+
 def main():
     src = Path(sys.argv[1] if len(sys.argv) > 1 else "mtp.safetensors")
     cfg_path = Path(sys.argv[2] if len(sys.argv) > 2 else "config.json")
@@ -182,6 +205,7 @@ def main():
 
     info = b""
     offset = 0
+    q8 = os.environ.get("STRATA_DSPARK_Q8", "") not in ("", "0")
     blobs = []
     # Tensors that share a source array (output_norm == dspark_norm) are written once and their
     # offsets point at the same bytes; GGUF allows that and it keeps the offsets consistent.
@@ -196,13 +220,17 @@ def main():
             at = offset
             seen[key] = at
             b = arr.tobytes()
+            ty = GGML_F32
+            if q8 and arr.ndim == 2 and arr.shape[1] % 32 == 0:
+                b = b"".join(q8_0_row(r) for r in arr)
+                ty = GGML_Q8_0
             blobs.append(b)
             offset += len(b)
         info += gguf_str(name)
         info += struct.pack("<I", len(dims))
         for d in dims:
             info += struct.pack("<Q", d)
-        info += struct.pack("<I", GGML_F32)
+        info += struct.pack("<I", ty)
         info += struct.pack("<Q", at)
 
     head = GGUF_MAGIC + struct.pack("<I", GGUF_VERSION) + struct.pack("<Q", len(names)) + struct.pack("<Q", kv_count)
