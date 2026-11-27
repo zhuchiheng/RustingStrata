@@ -305,7 +305,8 @@ impl Runner<'_> {
         match self {
             Runner::Cpu(m, st) => { *st = State::new(&m.cfg); vision::feed_prompt(m, st, p, embs) }
             Runner::Gpu(g) => g.prefill_image(p, embs),
-            Runner::Slot(_) | Runner::Own(_) => anyhow::bail!("image input is not supported on a serve slot"),
+            Runner::Slot(c) => c.chat_image(p, embs),
+            Runner::Own(_) => anyhow::bail!("image input on a model outside the main engine"),
         }
     }
     /// Forget the sequence so far.
@@ -417,6 +418,7 @@ impl Engine {
 
     /// Hand `--backend`, `--device`, and `--kv` to the DeepSeek, GLM, Gemma 4 and Inkling 2 paths.
     fn ds_env(&self) -> anyhow::Result<()> {
+        if self.gpu { vision::use_gpu(self.backend.clone(), self.device.first().copied().unwrap_or(0)); }
         // SAFETY: called at the start of a command, before any thread reads these variables.
         if let Some(b) = &self.backend { unsafe { std::env::set_var("STRATA_DS_BACKEND", b) } }
         if self.device != [0] { unsafe { std::env::set_var("STRATA_DS_DEVICES", self.device.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(",")) } }
@@ -515,6 +517,7 @@ impl Engine {
         }
         let mut ngram_cfg = self.ngram_config()?;
         ngram_cfg.n_vocab = m.cfg.n_vocab;
+        let auto_chunk = self.chunk.is_none();
         self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
         // The draft count was measured with this draft file (`calibrate --mtp-model/--draft-model`), or with none.
         let aux = self.aux_model_path().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
@@ -574,10 +577,20 @@ impl Engine {
             Some(s) => Some(s),
             None => calibrated_split(&v, &self.device, &bk.iter().map(|b| b.device()).collect::<Vec<_>>()),
         };
-        let mut g = if self.parallel > 1 {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), 0, self.parallel).context(LOAD_HINT)?
-        } else {
-            GpuModel::load_split_margins(m, bk, self.ctx, self.chunk(), &margins, split.as_deref(), mtp, 1).context(LOAD_HINT)?
+        let (ns, k) = if self.parallel > 1 { (self.parallel, 0) } else { (1, mtp) };
+        let mut bk = Some(bk);
+        let mut g = loop {
+            match GpuModel::load_split_margins(m, bk.take().unwrap(), self.ctx, self.chunk(), &margins, split.as_deref(), k, ns) {
+                // The prefill scratch grows with the chunk: when the default or calibrated chunk runs VRAM out or
+                // leaves it under the margin, halve it (down to 512) and load again on freshly opened devices.
+                Err(e) if auto_chunk && self.chunk() > 512 && vram_short(&e) => {
+                    let half = self.chunk() / 2;
+                    say!("prefill chunk {} leaves too little VRAM, loading again with {half} (--chunk sets it)", self.chunk());
+                    self.chunk = Some(half);
+                    bk = Some(backend::open_all(self.backend.as_deref(), &self.device)?);
+                }
+                r => break r.context(LOAD_HINT)?,
+            }
         };
         if ngram_cfg.is_enabled() && self.parallel <= 1 {
             let tok = Tokenizer::from_gguf(&m.w.g).ok();
@@ -765,6 +778,12 @@ fn seed(s: Option<u64>) -> u64 {
         .wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
 }
 
+/// Whether a load failed for VRAM: the driver's out-of-memory error (CUDA, HIP, Vulkan) or `GpuModel::load`'s check
+/// that the loaded model leaves the margin free.
+fn vram_short(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}").to_lowercase();
+    ["out_of_memory", "out of memory", "outofmemory", "out_of_device_memory", "of vram free, under the"].iter().any(|k| s.contains(k))
+}
 const LOAD_HINT: &str = "loading the model onto the GPU failed (if VRAM ran out: lower --ctx, add --kv q8, or close programs using VRAM)";
 
 /// Settle the flag combinations that cannot all take effect: an invalid request (`--parallel` outside 1..=255) is an
@@ -825,6 +844,23 @@ fn calibration_fits(v: &serde_json::Value, gpu: &str) -> bool {
 
 /// Values a calibrated chunk may write to the environment. An explicit value set by the user must win, so the
 /// caller skips names that are already present.
+/// OpenAI stream deltas for tool calls (issue 122): a call not sent yet goes out with its id and name, then the part
+/// of its arguments past what `sent` holds. Arguments that do not start with what was sent add nothing.
+fn call_deltas(calls: &[(String, String)], sent: &mut Vec<String>, i: impl std::fmt::Display) -> Vec<serde_json::Value> {
+    let mut v = Vec::new();
+    for (k, (f, a)) in calls.iter().enumerate() {
+        if k == sent.len() {
+            v.push(json!({"index": k, "id": format!("call_{i}_{k}"), "type": "function", "function": {"name": f, "arguments": ""}}));
+            sent.push(String::new());
+        }
+        if a.len() > sent[k].len() && a.starts_with(sent[k].as_str()) {
+            v.push(json!({"index": k, "function": {"arguments": &a[sent[k].len()..]}}));
+            sent[k] = a.clone();
+        }
+    }
+    v
+}
+
 fn chunk_env_updates(n: usize, present: impl Fn(&str) -> bool) -> Vec<(&'static str, String)> {
     if !(1..=(1 << 20)).contains(&n) { return vec![]; }
     ["STRATA_DS_CHUNK", "STRATA_GLM_CHUNK", "STRATA_G4_CHUNK"].into_iter()
@@ -1008,6 +1044,10 @@ enum Cmd {
         #[command(flatten)]
         engine: Engine,
     },
+    /// Print the tokens `serve` answered, by model and by API key name, over all runs. The totals are kept in
+    /// usage.json next to the default models folder; delete that file to start again.
+    #[command(alias = "statistics")]
+    Stats,
     /// Replace this binary with the newest GitHub release (Linux and Windows x86_64). The old one is kept as
     /// `<name>.old`.
     Update {
@@ -1296,6 +1336,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
                    RUSTFLAGS=\"-C target-cpu=native\" (or x86-64-v3), or use a release binary.");
     }
     match cmd {
+        Cmd::Stats => {
+            let f = usage_file();
+            let u = serve::Usage::load(&f)?;
+            if u.models.is_empty() { println!("no requests recorded yet in {}", f.display()); }
+            else { print!("{}", u.table()); println!("({})", f.display()); }
+        }
         Cmd::Update { check } => rusting_strata::update::run(check)?,
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
@@ -3375,6 +3421,8 @@ enum Job {
     /// `prefill_cached` in a free slot; answers the logits, the tokens reused, the slot and when the prefill began.
     /// `gone` is set when the client leaves while the chat waits for a slot; the chat is then dropped.
     Chat { ids: Vec<u32>, sys: usize, keep: usize, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
+    /// `prefill_image` in a free slot, answered as `Chat` (no tokens reused).
+    Image { p: vision::Prompt, embs: Vec<Vec<Vec<f32>>>, owner: u64, gone: std::sync::Arc<std::sync::atomic::AtomicBool>, back: std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>> },
     /// One decode step in a slot the request holds; answers the greedy next token and the logits if `logits`.
     Step { slot: usize, token: u32, logits: bool, back: std::sync::mpsc::Sender<anyhow::Result<(u32, Vec<f32>)>> },
     /// The request is done with its slot.
@@ -3388,10 +3436,20 @@ struct Client { tx: std::sync::mpsc::Sender<Job>, slot: Option<usize>, owner: u6
 
 impl Client {
     fn chat(&mut self, ids: &[u32], sys: usize, keep: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        let ids = ids.to_vec();
+        self.submit(|owner, gone, back| Job::Chat { ids, sys, keep, owner, gone, back })
+    }
+    fn chat_image(&mut self, p: &vision::Prompt, embs: &[Vec<Vec<f32>>]) -> anyhow::Result<Vec<f32>> {
+        let (p, embs) = (p.clone(), embs.to_vec());
+        Ok(self.submit(|owner, gone, back| Job::Image { p, embs, owner, gone, back })?.0)
+    }
+    /// Send a prompt job and wait for its slot.
+    fn submit(&mut self, job: impl FnOnce(u64, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::mpsc::Sender<anyhow::Result<(Vec<f32>, usize, usize, Instant)>>) -> Job)
+        -> anyhow::Result<(Vec<f32>, usize)> {
         if let Some(s) = self.slot.take() { let _ = self.tx.send(Job::Done(s)); }
         let (back, r) = std::sync::mpsc::channel();
         let gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.tx.send(Job::Chat { ids: ids.to_vec(), sys, keep, owner: self.owner, gone: gone.clone(), back }).map_err(|_| anyhow::anyhow!("model gone"))?;
+        self.tx.send(job(self.owner, gone.clone(), back)).map_err(|_| anyhow::anyhow!("model gone"))?;
         let (logits, reused, s, started) = loop {
             match r.recv_timeout(Duration::from_millis(250)) {
                 Ok(x) => break x?,
@@ -3444,7 +3502,7 @@ impl Sched {
     /// customer's burst of requests does not hold back the others'. With one key (or none) it is the oldest.
     fn next_chat(&self) -> Option<usize> {
         let holds = |o: u64| self.held.iter().zip(&self.who).filter(|&(&h, &w)| h && w == o).count();
-        (0..self.chats.len()).min_by_key(|&j| (if let Job::Chat { owner, .. } = &self.chats[j] { holds(*owner) } else { usize::MAX }, j))
+        (0..self.chats.len()).min_by_key(|&j| (if let Job::Chat { owner, .. } | Job::Image { owner, .. } = &self.chats[j] { holds(*owner) } else { usize::MAX }, j))
     }
 
     /// How long to wait for jobs: until the steps of all decoding slots are in, at most `GATHER` after the first.
@@ -3477,12 +3535,31 @@ impl Sched {
         // ponytail: fixed row count from which the GEMM forward (`step_batch`) replaces the matvec one; `calibrate`
         // should measure it per model and machine. STRATA_BATCH_MIN overrides. With experts 16: below it the step of
         // `STEP_ROWS` rows, whose missed experts the CPU worker runs beside the GPU, was faster (Qwen3.6-35B-A3B, RTX 3060).
-        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 8 });
+        // Dense 4: at 4 rows step_batch took 15.9 ms against step_rows' 17.0 (Qwen3-4B Q4_K_M) and 29.4 against 36.9
+        // (BF16), and from 5 rows step_rows needs two forwards.
+        let min = std::env::var("STRATA_BATCH_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(if g.is_moe() { 16 } else { 4 });
         let big = g.batch_cap() > 0 && self.steps.len() >= min;
         let cap = if big { g.batch_cap() } else { rusting_strata::gpu_model::STEP_ROWS };
-        let mut batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
-        batch.sort_by_key(|s| s.0);
+        let batch: Vec<_> = self.steps.drain(..self.steps.len().min(cap)).collect();
         self.since = if self.steps.is_empty() { None } else { Some(Instant::now() - Self::GATHER) };
+        // ponytail: a slot that holds an image prompt (RoPE offset from its KV rows) steps alone; give the batched
+        // forwards per-row offsets if image chats under --parallel get common.
+        let (lone, mut batch): (Vec<_>, Vec<_>) = batch.into_iter().partition(|b| g.slot_shifted(b.0));
+        for (sl, token, want, back) in lone {
+            g.use_slot(sl);
+            let _ = back.send(g.step(token).map(|l| (rusting_strata::ops::argmax(&l) as u32, if want { l } else { vec![] })));
+        }
+        // A slot whose KV cannot grow for its token (no VRAM left) fails alone, not the whole forward.
+        batch.retain(|b| match g.kv_step(b.0) { Ok(()) => true, Err(err) => { let _ = b.3.send(Err(err)); false } });
+        if batch.is_empty() { return; }
+        batch.sort_by_key(|s| s.0);
+        // The batched forwards read the current slot's RoPE offset: make an unshifted slot current.
+        g.use_slot(batch[0].0);
+        let big = big && batch.len() >= min;
+        if !big && batch.len() > rusting_strata::gpu_model::STEP_ROWS {
+            self.steps.extend(batch.drain(rusting_strata::gpu_model::STEP_ROWS..));
+            self.since = Some(Instant::now() - Self::GATHER);
+        }
         let rows: Vec<_> = batch.iter().map(|b| (b.0, b.1, b.2)).collect();
         match if big { g.step_batch(&rows) } else { g.step_rows(&rows) } {
             Ok(rows) => for (b, l) in batch.into_iter().zip(rows) { let _ = b.3.send(Ok(l)); },
@@ -3545,12 +3622,17 @@ impl Serving {
                 s.take(&jobs, s.wait());
                 // Prefill between decode steps, in the free slot whose saved state the prompt extends the furthest, else
                 // the least recently used one.
-                s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } if gone.load(Relaxed)));
+                s.chats.retain(|j| !matches!(j, Job::Chat { gone, .. } | Job::Image { gone, .. } if gone.load(Relaxed)));
                 // Models with a batched forward prefill the queued prompts together, one free slot each.
                 let lim = g.batch_cap().max(1);
                 let fits = |c: &Job| matches!(c, Job::Chat { ids, .. } if ids.len() <= g.ctx());
                 let mut adm: Vec<(usize, Job)> = vec![];
-                while adm.len() < lim {
+                // An image prompt runs alone, in the least recently used free slot.
+                if let Some(j) = s.next_chat().filter(|&j| matches!(s.chats[j], Job::Image { .. }))
+                    && let Some(sl) = (0..n).filter(|&i| !s.held[i]).min_by_key(|&i| s.freed[i]) {
+                    adm.push((sl, s.chats.remove(j).unwrap()));
+                }
+                while adm.len() < lim && !matches!(adm.first(), Some((_, Job::Image { .. }))) {
                     let Some(j) = s.next_chat() else { break };
                     if !adm.is_empty() && !(fits(&s.chats[j]) && fits(&adm[0].1)) { break; }
                     let Job::Chat { ids, keep, owner, .. } = &s.chats[j] else { break };
@@ -3588,14 +3670,23 @@ impl Serving {
                                 Err(e) => adm.iter().map(|_| Err(serve::copy_err(&e))).collect(),
                             }
                         } else {
-                            let (sl, Job::Chat { ids, sys, keep, owner, .. }) = &adm[0] else { unreachable!() };
-                            g.use_slot(*sl);
-                            g.owner = *owner;
-                            vec![g.prefill_cached_with(ids, *sys, *keep, &mut between)]
+                            match &adm[0] {
+                                (sl, Job::Chat { ids, sys, keep, owner, .. }) => {
+                                    g.use_slot(*sl);
+                                    g.owner = *owner;
+                                    vec![g.prefill_cached_with(ids, *sys, *keep, &mut between)]
+                                }
+                                (sl, Job::Image { p, embs, owner, .. }) => {
+                                    g.use_slot(*sl);
+                                    g.owner = *owner;
+                                    vec![g.prefill_image_with(p, embs, &mut between).map(|l| (l, 0))]
+                                }
+                                _ => unreachable!(),
+                            }
                         }
                     };
                     for ((sl, c), r) in adm.into_iter().zip(res) {
-                        let Job::Chat { owner, back, .. } = c else { unreachable!() };
+                        let (Job::Chat { owner, back, .. } | Job::Image { owner, back, .. }) = c else { unreachable!() };
                         (s.held[sl], s.who[sl]) = (r.is_ok(), owner);
                         // A client that left during the prefill takes no slot.
                         if back.send(r.map(|(l, u)| (l, u, sl, started))).is_err() && s.held[sl] {
@@ -3794,6 +3885,9 @@ fn gpu_model_stats(g: &GpuModel, s: &mut serve::Stats) {
 }
 
 /// Default models folder: `$XDG_DATA_HOME`, `%LOCALAPPDATA%` on Windows, else `~/.local/share`.
+/// The totals behind `rustingstrata stats`, next to the default models folder.
+fn usage_file() -> PathBuf { models_dir_default().with_file_name("usage.json") }
+
 fn models_dir_default() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME").or_else(|| std::env::var_os("LOCALAPPDATA")).map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
@@ -3819,25 +3913,8 @@ fn text_delta(w: &mut impl Write, opened: &mut bool, t: &str) -> anyhow::Result<
     sse(w, json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": t}}))
 }
 
-/// The `timings` block llama-server puts in its responses. llama-swap and other
-/// OpenAI-compatible clients read it for prefill/decode rates. `prompt_n` is the
-/// uncached part of the prompt and `cache_n` the part served from cache, as in
-/// llama-server.
 fn llama_timings(l: &serve::Last) -> serde_json::Value {
-    let prompt_n = l.prompt_tokens.saturating_sub(l.cached_tokens);
-    let per_token_ms = |ms: f64, n: usize| if n == 0 { 0.0 } else { ms / n as f64 };
-    let per_second = |ms: f64, n: usize| if ms > 0.0 { n as f64 * 1e3 / ms } else { 0.0 };
-    json!({
-        "prompt_n": prompt_n,
-        "prompt_ms": l.prefill_ms,
-        "prompt_per_token_ms": per_token_ms(l.prefill_ms, prompt_n),
-        "prompt_per_second": per_second(l.prefill_ms, prompt_n),
-        "predicted_n": l.completion_tokens,
-        "predicted_ms": l.decode_ms,
-        "predicted_per_token_ms": per_token_ms(l.decode_ms, l.completion_tokens),
-        "predicted_per_second": per_second(l.decode_ms, l.completion_tokens),
-        "cache_n": l.cached_tokens,
-    })
+    serve::timings(l.prompt_tokens, l.cached_tokens, l.completion_tokens, l.prefill_ms, l.decode_ms)
 }
 
 /// The chat page, served by the connection threads of `strata serve`.
@@ -3995,6 +4072,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                     // A failed write must not fail the reply; it is reported.
                     if let Err(err) = writeln!(f.lock().unwrap(), "{v}") { say!("usage log: {err}"); }
                 }
+                if let Err(err) = serve::Usage::add(&usage_file(), key_name, last) { say!("stats: {err:#}"); }
             };
             // A model outside the main engine answers the request itself (greedy; it fails before it writes).
             if let Runner::Own(chat) = r {
@@ -4078,6 +4156,7 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
             let mut k = 0;  // tokens decoded
             let mut opened = false;  // Messages API stream: the text block has started
             let mut hold = Hold::new(tools, req.stop);
+            let mut streamed = Vec::new();  // the tool-call arguments a stream has sent
             // A prompt that ends in an open think block makes the reply start with reasoning, up to `</think>`.
             let think_open = prompt.trim_end().ends_with("<think>");
             let mut think = Think::new(think_open);
@@ -4133,6 +4212,12 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                         } else if last_stream_activity.elapsed() >= Duration::from_secs(15) {
                             w.write_all(b": keep-alive\n\n")?;
                             last_stream_activity = Instant::now();
+                        }
+                        if tools && !anth {
+                            for d in call_deltas(&tpl.partial_calls(&hold.text, &req.tools), &mut streamed, i) {
+                                write!(w, "data: {}\n\n", chunk(json!({"tool_calls": [d]}), None))?;
+                                last_stream_activity = Instant::now();
+                            }
                         }
                     }
                     Ok(hold.stopped)
@@ -4210,7 +4295,8 @@ fn handle(mut w: TcpStream, q: anyhow::Result<serve::Request>, l: Option<&mut Lo
                 "prompt_tokens_details": {"cached_tokens": cached}});
             if req.stream {
                 match &calls {
-                    Some(c) => write!(w, "data: {}\n\n", chunk(calls_json(c, true), None))?,
+                    Some(c) => for d in call_deltas(&c.1, &mut streamed, i) { write!(w, "data: {}\n\n", chunk(json!({"tool_calls": [d]}), None))?; },
+                    // ponytail: a call that streamed and then fails to parse also goes out as text; the client saw part of a call.
                     None => {
                         let (r, a) = think.feed(hold.rest());
                         send_split(&mut w, &chunk, (r, a))?;

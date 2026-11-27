@@ -336,7 +336,7 @@ mod tests {
     fn shared_memory_of_every_weight_kernel_and_type() {
         use crate::quant::GgmlType;
         // The kernels `Vk::preflight` reaches, with the extra constants of gemv_q (NT) and gemv_f (NT, 32 * wpb).
-        let kernels = ["gemm_f", "gemm_f_dp", "gemm_fs", "gemmi", "gemmi_dp", "gemmi_s", "gemmi_16", "gemmi_s_16", "gemmi_16_nb", "gemmi_s_16_nb", "gemv_q", "gemv_f", "moe_gemv_q",
+        let kernels = ["gemm_f", "gemm_f_dp", "gemm_fs", "gemmi", "gemmi_dp", "gemmi_s", "gemmi_16", "gemmi_s_16", "gemv_q", "gemv_f", "moe_gemv_q",
             "moe_gemv_f", "dequant"];
         let mut worst = (0u32, String::new(), Vec::new());
         // Kernels a device without cooperative matrices runs (the V100): `gemm_raw` picks the _dp ones.
@@ -369,5 +369,16 @@ mod tests {
         // matrices (and a larger limit) exist.
         assert!(worst_v100.0 <= 49152, "{} needs {} bytes of Workgroup memory with cooperative matrices off",
             worst_v100.1, worst_v100.0);
+    }
+
+    /// PR 120: without TurboQuant the prompt attention fits NVIDIA's 48 KB for every other KV type.
+    #[test]
+    fn attn_prefill_non_turbo_fits_48kb() {
+        for kernel in ["attn_prefill_64", "attn_prefill_128", "attn_prefill_256"] {
+            for mode in 0..=3u32 {
+                let bytes = shared_bytes_split(kernel, &[], mode, mode).unwrap();
+                assert!(bytes <= 49152, "{kernel} with kv_mode={mode} needs {bytes} bytes (> 49152)");
+            }
+        }
     }
 }

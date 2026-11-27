@@ -12,9 +12,9 @@ __device__ __forceinline__ float h2f(u16 h) { return (float)*(const _Float16*)&h
 __device__ __forceinline__ u16 f2h(float f) { _Float16 x = (_Float16)f; return *(const u16*)&x; }
 #else
 __device__ __forceinline__ float h2f(u16 h) { float f; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h)); return f; }
-__device__ __forceinline__ float2 ink_h2f2(unsigned w) { return make_float2(h2f((u16)(w & 0xFFFFu)), h2f((u16)(w >> 16))); }
 __device__ __forceinline__ u16 f2h(float f) { u16 h; asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f)); return h; }
 #endif
+__device__ __forceinline__ float2 ink_h2f2(unsigned w) { return make_float2(h2f((u16)(w & 0xFFFFu)), h2f((u16)(w >> 16))); }
 __device__ __forceinline__ u32 ld16(const u8* p) { return *(const u16*)p; }  // 2-aligned only (every quant field is)
 __device__ __forceinline__ u32 ld32(const u8* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
 __device__ __forceinline__ float ldh(const u8* p) { return h2f((u16)ld16(p)); }
@@ -1152,10 +1152,14 @@ __device__ __forceinline__ u32 h2pack(float a, float b) { return (u32)f2h(a) | (
 // SM (gemms_*, tile lists only): the tiles of at most 32 positions (most expert tiles), which the SM = false kernel
 // skips; their 32 x 64 outputs go 16 x 16 per warp (positions wm, rows wn, in acc[0][0..1]). Each output sums the
 // same products in the same order either way. (A runtime branch in one kernel costs the big tiles a third.)
-template <int T, int SBB, int BM, int BK, bool SM>
+// SMX (SM, mma16816 path only): 32-position halves a block, each warp taking 16 x 16 outputs in each half.
+// XH: x holds halves (x_to_f16), x_stride counted in halves.
+template <int T, int SBB, int BM, int BK, bool SM, int SMX = 1, bool XH = false>
 __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int nd, const float* __restrict__ x, int x_stride,
-                                       const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {
-    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 : BM;  // smem pitch in halves (padding: conflict-free fragments)
+                                       const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc,
+                                       float* yo = nullptr, int yo_stride = 0, int yact = 0, int* cnt = nullptr) {
+    constexpr bool PF = SM;  // X prefetch (below)
+    constexpr int P = BK + 8, NT = BM * 2, SUBS = BK / 8, XM = SM ? 32 * SMX : BM;  // smem pitch in halves (padding: conflict-free fragments)
     __shared__ __align__(16) u16 xs[XM * P], ws[64 * P];
     GemmTile tl = tiles ? tiles[blockIdx.y] : GemmTile{wd, (int)blockIdx.y * XM, min(XM, nd - (int)blockIdx.y * XM)};
     if (tiles && (tl.cnt <= 32) != SM) return;
@@ -1165,7 +1169,8 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
     #pragma unroll
     for (int q = 0; q < XM * BK / 4 / NT; q++) {
         int r = (tid + q * NT) / (BK / 4);
-        xr[q] = r < tl.cnt ? x + (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride : nullptr;
+        size_t off = (size_t)(xrow ? xrow[tl.m0 + r] : tl.m0 + r) * x_stride;
+        xr[q] = r >= tl.cnt ? nullptr : XH ? (const float*)((const u16*)x + off) : x + off;
     }
     float acc[2][4][4] = {};
 #if __CUDA_ARCH__ < 800 && GEMM_TC
@@ -1200,19 +1205,35 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
         #pragma unroll
         for (int q = 0; q < WQ; q++) { int i = tid + q * NT; *(uint4*)(ws + (i / SUBS) * P + (i % SUBS) * 8) = wv[q]; }
     };
-    const int nk = n64 * 64 / BK;
+    // Split K (gemm_raw, a batched decode step of few blocks): grid.z segments of the K steps, segment z writing
+    // its partial sums at y + z * nd * y_stride for gemm_splitk_sum to add up in a fixed order.
+    const int nk = n64 * 64 / BK, kb0 = nk * blockIdx.z / gridDim.z, kb1 = nk * (blockIdx.z + 1) / gridDim.z;
+    y += (size_t)blockIdx.z * nd * y_stride;
     if constexpr (T == 17 || T == 18 || T == 21 || T == 22) { QS<T>::load(); __syncthreads(); }
-    ldw(0);
+    // SM: X step kb + 1 is loaded into registers with W's, during step kb's mma (2 float4 a thread; the big tile's
+    // 8 cost more registers than they save: 48 rows of a batched BF16 step took 57.7 ms against 50.4).
+    float4 xv[XM * BK / 4 / NT];
+    uint2 xh[XM * BK / 4 / NT];
+    auto ldx = [&](int kb) {
+        #pragma unroll
+        for (int q = 0; q < XM * BK / 4 / NT; q++) {
+            int c = kb * BK + (tid + q * NT) % (BK / 4) * 4;
+            if constexpr (XH) xh[q] = xr[q] ? *(const uint2*)((const u16*)xr[q] + c) : make_uint2(0, 0);
+            else xv[q] = xr[q] ? *(const float4*)(xr[q] + c) : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    ldw(kb0);
+    if constexpr (PF) ldx(kb0);
     stw();
-    for (int kb = 0; kb < nk; kb++) {
+    for (int kb = kb0; kb < kb1; kb++) {
+        if constexpr (!PF) ldx(kb);
         #pragma unroll
         for (int q = 0; q < XM * BK / 4 / NT; q++) {
             int i = tid + q * NT, r = i / (BK / 4), c = (i % (BK / 4)) * 4;
-            float4 v = xr[q] ? *(const float4*)(xr[q] + kb * BK + c) : make_float4(0.f, 0.f, 0.f, 0.f);
-            *(uint2*)(xs + r * P + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
+            *(uint2*)(xs + r * P + c) = XH ? xh[q] : make_uint2(h2pack(xv[q].x, xv[q].y), h2pack(xv[q].z, xv[q].w));
         }
         __syncthreads();
-        if (kb + 1 < nk) ldw(kb + 1);
+        if (kb + 1 < kb1) { ldw(kb + 1); if constexpr (PF) ldx(kb + 1); }
         // Expert tiles are often part full; a warp whose 32 positions are all past cnt has nothing to multiply.
         if (wm < tl.cnt)
 #pragma unroll
@@ -1259,11 +1280,11 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 }
             }
 #else
-            constexpr int MT = SM ? 1 : 2, NT8 = SM ? 2 : 4;
+            constexpr int MT = SM ? SMX : 2, NT8 = SM ? 2 : 4, MS = SM ? 32 : 16;
             u32 a[2][4], b[4][2];
             #pragma unroll
             for (int mt = 0; mt < MT; mt++) {
-                const u16* p = xs + (wm + mt * 16 + g) * P + kk + 2 * t;
+                const u16* p = xs + (wm + mt * MS + g) * P + kk + 2 * t;
                 a[mt][0] = ld_s32(p); a[mt][1] = ld_s32(p + 8 * P); a[mt][2] = ld_s32(p + 8); a[mt][3] = ld_s32(p + 8 * P + 8);
             }
             #pragma unroll
@@ -1278,7 +1299,7 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
 #endif
         }
         __syncthreads();
-        if (kb + 1 < nk) stw();
+        if (kb + 1 < kb1) stw();
     }
 #if GEMM_WMMA
     // D layout of the AMD WMMA: the lane keeps column lane & 15 and rows STRATA_WMMA_ROW(lane, 0..7) of each tile.
@@ -1325,12 +1346,12 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
             }
 #else
     #pragma unroll
-    for (int mt = 0; mt < (SM ? 1 : 2); mt++)
+    for (int mt = 0; mt < (SM ? SMX : 2); mt++)
         #pragma unroll
         for (int nt = 0; nt < (SM ? 2 : 4); nt++)
             #pragma unroll
             for (int h = 0; h < 2; h++) {
-                int r = wm + mt * 16 + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
+                int r = wm + mt * (SM ? 32 : 16) + g + 8 * h, n = n0 + wn + nt * 8 + 2 * t;
                 if (r >= tl.cnt) continue;
                 float* yr = y + (size_t)(tl.m0 + r) * y_stride;
                 #pragma unroll
@@ -1341,6 +1362,39 @@ __device__ __forceinline__ void gemm_q(const GemmTile* tiles, const u8* wd, int 
                 }
             }
 #endif
+    // Split K with cnt: the last segment of a tile to finish adds the partial sums of all segments into yo, in
+    // gemm_splitk_sum's order (the same bits), and clears the tile's counter for the next launch.
+    if (cnt && gridDim.z > 1) {
+        __shared__ int last;
+        __threadfence();
+        __syncthreads();
+        int* c = cnt + blockIdx.y * gridDim.x + blockIdx.x;
+        if (tid == 0) last = atomicAdd(c, 1) == (int)gridDim.z - 1;
+        __syncthreads();
+        if (!last) return;
+        __threadfence();
+        const float* part = y - (size_t)blockIdx.z * nd * y_stride;
+        // 4 consecutive results a thread, all segments' loads in flight before the adds (gemm_raw splits at most 8).
+        const int ks = gridDim.z;
+        for (int i = tid * 4; i < tl.cnt * 64; i += NT * 4) {
+            int r = tl.m0 + i / 64, n = n0 + i % 64;
+            if (n >= rows) continue;
+            float4 p[8];
+            #pragma unroll
+            for (int z = 0; z < 8; z++)
+                if (z < ks) p[z] = __ldcg((const float4*)(part + (size_t)z * nd * y_stride + (size_t)r * y_stride + n));
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            #pragma unroll
+            for (int z = 0; z < 8; z++)
+                if (z < ks) { v.x += p[z].x; v.y += p[z].y; v.z += p[z].z; v.w += p[z].w; }
+            float* yr = yo + (size_t)r * yo_stride + n;
+            float vv[4] = {v.x, v.y, v.z, v.w};
+            #pragma unroll
+            for (int e = 0; e < 4; e++)
+                if (n + e < rows) yr[e] = yact == 0 ? vv[e] : yact == 1 ? silu(yr[e]) * vv[e] : yr[e] + vv[e];
+        }
+        if (tid == 0) *c = 0;
+    }
 }
 
 #ifndef GEMM_BM
@@ -1360,6 +1414,13 @@ static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thr
 #else
 #define GEMM_LAUNCH_BOUNDS __launch_bounds__(GEMM_BM * 2)
 #endif
+// gemmm_* (batched decode of 33 to 64 positions, tiles == 0): 64 positions a block, x as halves (x_to_f16). With mma16816, the SM layout
+// over two 32-position halves; elsewhere gemm_*'s big tile.
+#if GEMM_WMMA || (__CUDA_ARCH__ < 800 && GEMM_TC)
+#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, false, 1, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc, yo, yo_stride, yact, cnt)
+#else
+#define GEMMM_BODY(T, SBB) gemm_q<T, SBB, GEMM_BM, GEMM_BK, true, 2, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc, yo, yo_stride, yact, cnt)
+#endif
 #define DEF_GEMM(T, NAME, SBB)                                                                                    \
     extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemm_##NAME(const GemmTile* tiles, const u8* wd, int nd,         \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
@@ -1368,8 +1429,32 @@ static_assert((64 * (GEMM_BK / 8)) % (2 * GEMM_BM) == 0, "whole W groups per thr
     extern "C" __global__ void GEMM_LAUNCH_BOUNDS gemms_##NAME(const GemmTile* tiles, const u8* wd, int nd,        \
             const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc) {  \
         gemm_q<T, SBB, GEMM_BM, GEMM_BK, true>(tiles, wd, nd, x, x_stride, xrow, y, y_stride, rows, n64, act, sc);  \
+    }                                                                                                             \
+    extern "C" __global__ void __launch_bounds__(GEMM_BM * 2, 3) gemmm_##NAME(const GemmTile* tiles, const u8* wd, int nd,  \
+            const float* x, int x_stride, const int* xrow, float* y, int y_stride, int rows, int n64, int act, float sc,  \
+            float* yo, int yo_stride, int yact, int* cnt) {                                                             \
+        GEMMM_BODY(T, SBB);                                                                                             \
     }
 QTYPES(DEF_GEMM)
+
+// x (nd rows of cols floats, cols % 4 == 0) as halves for gemmm_*: the same h2pack rounding gemm_q applies.
+extern "C" __global__ void x_to_f16(const float* x, int x_stride, int nd, int cols, u16* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x, c4 = cols / 4;
+    if (i >= nd * c4) return;
+    int r = i / c4, c = i % c4 * 4;
+    float4 v = *(const float4*)(x + (size_t)r * x_stride + c);
+    *(uint2*)(out + (size_t)r * cols + c) = make_uint2(h2pack(v.x, v.y), h2pack(v.z, v.w));
+}
+
+// Sums the ks segments of a split-K gemm (part: ks x nd x rows) in order into y, with gemm_q's act.
+extern "C" __global__ void gemm_splitk_sum(const float* part, int ks, int nd, int rows, float* y, int y_stride, int act) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nd * rows) return;
+    float v = 0.f;
+    for (int z = 0; z < ks; z++) v += part[(size_t)z * nd * rows + i];
+    float* yr = y + (size_t)(i / rows) * y_stride + i % rows;
+    *yr = act == 0 ? v : act == 1 ? silu(*yr) * v : *yr + v;
+}
 
 // ---- prefill GEMM on int8 tensor cores (integer weight types) ----
 // X is first quantized by quant_q8 into q8 rows: cols int8, then cols / 32 f32 scales, then cols / 16 f32 sums of the
@@ -1648,10 +1733,10 @@ ITYPES(DEF_GEMMI)
 // two mmas per 32 columns, each with the lanes of the other half zeroed.
 // X (q8 rows) is the B operand, from a shared-memory window of GEMMD_XW(pb) columns that cp.async double-buffers: one
 // barrier per window.
-// ks = 2: two blocks (seg 0, 1) share 128 rows, each over half of the columns (Gpu::gemm_raw has the rule and the
-// measurement). Both blocks store their partial sums in scr ([seg][position][row]); the one that ends second (flag:
-// the count of blocks done for these rows, over all launches) adds the other's and writes y. a + b is b + a, so the
-// result does not depend on which block that is.
+// ks > 1: ks blocks (seg 0 .. ks - 1) share 128 rows, each over a ks-th of the column windows (Gpu::gemm_raw has the
+// rule and the measurement). Every block stores its partial sums in scr ([seg][position][row]); the one that ends last
+// (flag: the count of blocks done for these rows, reset to 0 by that block) adds them in segment order and writes y,
+// so the result does not depend on which block that is.
 #define GEMMD_XW(pb) ((pb) >= 32 ? 128 : 4096 / (pb))
 // XW: the window width when it is known at compile time (its pitch then makes the x loads' offsets immediates), else 0.
 // FULL: 64 positions, so every one of the 8 tiles has positions (no test a tile).
@@ -1834,7 +1919,7 @@ __device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, 
     }
     if (ks > 1) {
         float* mine = scr + (size_t)seg * nd * rows;
-        const volatile float* other = scr + (size_t)(seg ^ 1) * nd * rows;  // another block's stores: not cached
+        const volatile float* all = scr;  // other blocks' stores: not cached
         if (live) {
             #pragma unroll
             for (int j = 0; j < 32; j++) {
@@ -1844,16 +1929,32 @@ __device__ __forceinline__ void gemmd_qx(const u8* w, const u8* __restrict__ x, 
         }
         __threadfence();  // every thread's sums are in memory before the count says so
         __syncthreads();
-        int* second = (int*)gemmd_s;
-        if (tid == 0) *second = atomicAdd(flag + rb, 1) & 1;
+        int* last = (int*)gemmd_s;
+        if (tid == 0) {
+            *last = atomicAdd(flag + rb, 1) == ks - 1;
+            if (*last) flag[rb] = 0;  // every block of these rows has counted: the next launch starts from 0
+        }
         __syncthreads();
-        if (!*second) return;
-        if (live) {
+        if (!*last) return;
+        if (live && ks == 2) {  // a + b is b + a: the other block's sums onto this one's
             #pragma unroll
             for (int j = 0; j < 32; j++) {
                 int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
-                if (r < rows && p < np) acc[j >> 2][j & 3] += other[(size_t)p * rows + r];
+                if (r < rows && p < np) acc[j >> 2][j & 3] += all[((size_t)(seg ^ 1) * nd + p) * rows + r];
             }
+        } else if (live) {
+            // Every segment from scr in segment order, whichever block ends last: the result does not depend on it.
+            for (int j = 0; j < 32; j++) {
+                int r = r0 + g + 8 * ((j >> 1) & 1), p = (j >> 2) * 8 + 2 * t + (j & 1);
+                if (r >= rows || p >= np) continue;
+                const volatile float* q = all + (size_t)p * rows + r;
+                float s = q[0];
+                for (int sg = 1; sg < ks; sg++) s += q[(size_t)sg * nd * rows];
+                float* yp = y + (size_t)p * y_stride + r;
+                float v = s * sc;
+                *yp = act == 0 ? v : act == 1 ? silu(*yp) * v : *yp + v;
+            }
+            return;
         }
     }
     if (live) {
@@ -2383,6 +2484,86 @@ extern "C" __global__ void attn_sel(const float* q, const u16* kc, const u16* vc
     for (int r = 0; r < nd; r++) o[c + 32 * r] = acc[r] / l;
 }
 
+// Vision encoder attention: each of the n query rows sees all n keys, no mask. q, k, v and out are f32 [n][nh][hd],
+// A block takes 32 query rows of head blockIdx.y (8 a warp) and walks the keys 32 at a time through shared memory,
+// one key a lane, with an online softmax. The 8 rows of a warp share each K and V load; the probabilities go through
+// shared memory, and each lane keeps its own part of the softmax sum until the end. A key row takes hd + 1 floats so
+// the 32 lanes, each on its own key, hit 32 banks. Shared memory: (64 * hd + 32 * (hd + 1) + 1024) floats.
+extern "C" __global__ void vit_attn(const float* q, const float* k, const float* v, float* out, int n, int nh, int hd, float scale) {
+    extern __shared__ float sm[];
+    float* qs = sm;
+    float* vs = qs + 32 * hd;
+    float* ks = vs + 32 * hd;
+    const int h = blockIdx.y, q0 = blockIdx.x * 32, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    float* ps = ks + 32 * (hd + 1) + w * 256;
+    const float* qw = qs + w * 8 * hd;
+    const size_t ld = (size_t)nh * hd;
+    for (int i = threadIdx.x; i < 32 * hd; i += blockDim.x) {
+        const int r = i / hd, d = i - r * hd;
+        qs[i] = q0 + r < n ? q[(q0 + r) * ld + h * hd + d] * scale : 0.f;
+    }
+    float m[8], l[8], o[8][4];
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        m[r] = __int_as_float(0xff800000); l[r] = 0.f;
+#pragma unroll
+        for (int c = 0; c < 4; c++) o[r][c] = 0.f;
+    }
+    for (int k0 = 0; k0 < n; k0 += 32) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 32 * hd; i += blockDim.x) {
+            const int r = i / hd, d = i - r * hd;
+            const bool in = k0 + r < n;
+            const size_t g = (k0 + r) * ld + h * hd + d;
+            ks[r * (hd + 1) + d] = in ? k[g] : 0.f;
+            vs[i] = in ? v[g] : 0.f;
+        }
+        __syncthreads();
+        const bool valid = k0 + lane < n;
+        const float* kr = ks + lane * (hd + 1);
+        float s[8];
+#pragma unroll
+        for (int r = 0; r < 8; r++) s[r] = 0.f;
+        for (int d = 0; d < hd; d++) {
+            const float kd = kr[d];
+#pragma unroll
+            for (int r = 0; r < 8; r++) s[r] += qw[r * hd + d] * kd;
+        }
+#pragma unroll
+        for (int r = 0; r < 8; r++) {
+            // The first tile always holds key 0, so mn is finite from then on and corr is 0 on the first tile.
+            const float mn = fmaxf(m[r], warp_max(valid ? s[r] : __int_as_float(0xff800000)));
+            const float p = valid ? __expf(s[r] - mn) : 0.f;
+            const float corr = __expf(m[r] - mn);
+            l[r] = l[r] * corr + p;
+            m[r] = mn;
+#pragma unroll
+            for (int c = 0; c < 4; c++) o[r][c] *= corr;
+            ps[r * 32 + lane] = p;
+        }
+        __syncwarp();
+        for (int j = 0; j < 32; j++) {
+            const float* vr = vs + j * hd;
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                if (lane + 32 * c >= hd) continue;
+                const float vv = vr[lane + 32 * c];
+#pragma unroll
+                for (int r = 0; r < 8; r++) o[r][c] += ps[r * 32 + j] * vv;
+            }
+        }
+        __syncwarp();
+    }
+#pragma unroll
+    for (int r = 0; r < 8; r++) {
+        const int t = q0 + w * 8 + r;
+        const float lt = warp_sum(l[r]);
+        if (t >= n) continue;
+#pragma unroll
+        for (int c = 0; c < 4; c++) if (lane + 32 * c < hd) out[t * ld + h * hd + lane + 32 * c] = o[r][c] / lt;
+    }
+}
+
 __device__ __forceinline__ unsigned ink_f2key(float x) {
     unsigned u = __float_as_uint(x == 0.0f ? 0.0f : x);
     return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -2489,8 +2670,10 @@ extern "C" __global__ void ssm_gates(float* beta, float* g, const float* dt_bias
 
 // Causal depthwise conv over [state..., current] then SiLU; state keeps the last kw-1 inputs, oldest first.
 // Block = 128 channels; the first nn blocks are then l2-normalized as l2_norm does (the decode q and k heads).
+// tab: grid.y rows, row r at qkv and y + r * ch with its state at tab[2r] (the layer's part of Batch::kvt).
 extern "C" __global__ void conv_silu(const float* qkv, float* state, const float* w, float* y, int ch, int kw, int nn,
-                                     float eps) {
+                                     float eps, const u64* tab) {
+    if (tab) { state = (float*)tab[2 * blockIdx.y]; qkv += (size_t)blockIdx.y * ch; y += (size_t)blockIdx.y * ch; }
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     float v = 0.0f;
     if (c < ch) {
@@ -2557,10 +2740,15 @@ extern "C" __global__ void dflash2_conv(const float* x, const float* dyn, const 
 // Token t: y + t * ych = [q | k | v] after conv and l2 norm; beta, g at t * nv; output at o + t * nv * dv.
 // With dtb set, beta and g are raw and get ssm_gates' gates here (dtb, ga as its dt_bias, a).
 // The state after each of the first min(nsnap, T - 1) tokens also goes to snap (S's layout, one state each).
+// tab: grid.z rows of one token, row r as token r of y, beta, g and o, with its state at tab[2r + 1].
 // ponytail: sequential scan (latency-bound per token); a chunked WY form would use tensor cores for long prompts.
 extern "C" __global__ void deltanet_seq(const float* y, float* S, const float* beta, const float* g, float* o,
                                         int nk, int nv, int ilv, int dk, int dv, float scale, int T, int ych, float* snap, int nsnap,
-                                        const float* dtb, const float* ga) {
+                                        const float* dtb, const float* ga, const u64* tab) {
+    if (tab) {
+        size_t r = blockIdx.z;
+        S = (float*)tab[2 * r + 1]; y += r * ych; beta += r * nv; g += r * nv; o += r * nv * dv;
+    }
     int L = dk >> 4, R = 32 / L, lane = threadIdx.x & 31, s = lane % L, vh = blockIdx.x, kh = ilv ? vh / (nv / nk) : vh % nk;
     int j0 = (blockIdx.y * 8 + (threadIdx.x >> 5)) * R, j = j0 + lane / L;
     if (j0 >= dv) return;  // whole warp past the end (R divides dv)

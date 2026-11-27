@@ -637,7 +637,6 @@ impl<'a> Inkling2Model<'a> {
         crate::ops::argmax(&logits) as u32
     }
 
-
     /// Add the time since `t` to part `i` of the profile; returns the time now.
     fn lap(&self, i: usize, t: std::time::Instant) -> std::time::Instant {
         self.prof[i].set(self.prof[i].get() + t.elapsed().as_secs_f64());
