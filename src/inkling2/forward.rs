@@ -1308,12 +1308,20 @@ impl<'a> Inkling2Model<'a> {
                 let target_end = self.toks.len() + seq.len() - 1;
                 match d.prepare(self, target_end) {
                     Ok(()) => {
-                        let chunk = env_chunk.unwrap_or(device::pf_tokens()).clamp(1, device::pf_tokens());
+                        let chunk_max = env_chunk.unwrap_or(device::pf_tokens()).clamp(1, device::pf_tokens());
                         let mut logits = vec![];
                         let mut done = 0usize;
                         let mut failed = None;
-                        for (i, c) in seq.chunks(chunk).enumerate() {
-                            let want = (i + 1) * chunk >= seq.len();
+                        // A chunk's prefill attention costs chunk times position, while its expert tiles want as many
+                        // positions as they can get: measured on an RX 7900 XTX, pp 8192 reads 971 tok/s at a chunk of
+                        // 1024 against 799 at 256, pp 16384 is a tie, and pp 65536 reads 405 at 256 against 223 at
+                        // 1024. They cross at about 16384, so the chunk drops there. The scratch is sized for
+                        // `pf_tokens()` either way, so only the work per submit changes.
+                        while done < seq.len() {
+                            let pos = self.toks.len();
+                            let chunk = if env_chunk.is_some() || pos < 16384 { chunk_max } else { chunk_max.min(256) };
+                            let c = &seq[done..(done + chunk).min(seq.len())];
+                            let want = done + c.len() >= seq.len();
                             let pos0 = self.toks.len();
                             match d.prefill_chunk_seq(self, c, want, cap_ds) {
                                 Ok((l, feats)) => {
