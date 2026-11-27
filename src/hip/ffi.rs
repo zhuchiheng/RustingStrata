@@ -51,6 +51,17 @@ fn find_gfx(bytes: &[u8]) -> Option<String> {
 }
 
 /// Library names to try, in order. `STRATA_HIP` (a path or a name) replaces the whole list.
+/// The runtime's file name per platform: the HIP SDK for Windows ships `amdhip64_6.dll` in `<version>\bin`, Linux the
+/// `libamdhip64.so*` chain. A wrong set here is what made the Windows backend report "no HIP runtime".
+#[cfg(windows)]
+const HIP_RUNTIME_NAMES: &[&str] = &["amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll", "amdhip64_5.dll"];
+#[cfg(not(windows))]
+const HIP_RUNTIME_NAMES: &[&str] = &["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"];
+#[cfg(windows)]
+const HIPRTC_NAMES: &[&str] = &["hiprtc.dll", "hiprtc0700.dll", "hiprtc0604.dll"];
+#[cfg(not(windows))]
+const HIPRTC_NAMES: &[&str] = &["libhiprtc.so", "libhiprtc.so.7", "libhiprtc.so.6"];
+
 fn candidates(vars: Option<PathBuf>, default_suffix: &[&str]) -> Vec<PathBuf> {
     if let Some(p) = vars { return vec![p]; }
     let mut v: Vec<PathBuf> = Vec::new();
@@ -59,7 +70,23 @@ fn candidates(vars: Option<PathBuf>, default_suffix: &[&str]) -> Vec<PathBuf> {
     for root in ["/opt/rocm/lib", "/opt/rocm/core-10.1/lib", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib"] {
         for s in default_suffix { v.push(PathBuf::from(root).join(s)); }
     }
-    v
+    // The HIP SDK for Windows keeps its DLLs in `<version>\bin`; the installer sets HIP_PATH to the version's root.
+    // An absolute DLL path is what makes the loader find the SDK's own dependencies (amd_comgr, hsa-runtime64) next
+    // to it, so these are tried before the bare name.
+    let mut win: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("HIP_PATH") { roots.push(PathBuf::from(p)); }
+    if let Some(p) = std::env::var_os("ROCM_PATH") { roots.push(PathBuf::from(p)); }
+    if let Ok(rd) = std::fs::read_dir(r"C:\Program Files\AMD\ROCm") {
+        for e in rd.flatten() { roots.push(e.path()); }
+    }
+    for root in roots {
+        for sub in ["bin", "lib"] {
+            for s in default_suffix { win.push(root.join(sub).join(s)); }
+        }
+    }
+    win.extend(v);
+    win
 }
 
 pub struct Hip {
@@ -102,7 +129,7 @@ impl Hip {
     /// The runtime, or an error naming what was missing. "HIP init" lets `backend::open` fall back to Vulkan.
     pub fn open() -> anyhow::Result<Hip> {
         let want = candidates(std::env::var_os("STRATA_HIP").map(Into::into),
-                              &["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]);
+                              HIP_RUNTIME_NAMES);
         let mut tried = Vec::new();
         for path in &want {
             if let Ok(lib) = unsafe { Library::new(path) } {
@@ -227,7 +254,7 @@ impl Rtc {
 
     fn open() -> Result<Rtc, String> {
         let want = candidates(std::env::var_os("STRATA_HIPRTC").map(Into::into),
-                              &["libhiprtc.so", "libhiprtc.so.7", "libhiprtc.so.6"]);
+                              HIPRTC_NAMES);
         let mut tried = Vec::new();
         for path in &want {
             let lib = match unsafe { Library::new(path) } {

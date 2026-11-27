@@ -160,6 +160,10 @@ __device__ __forceinline__ strata_hk strata_ld_wmma_t(const unsigned short* p, i
 #define __ballot_sync(m, p) (strata_hip::ballot_sync((m), (p)))
 #define __any_sync(m, p) (strata_hip::any_sync((m), (p)))
 #define __ldcg(p) (strata_hip::ldcg(p))
+// A wave is the whole warp here (wave32 on RDNA), so the active mask is full and re-converging is a wave barrier.
+// The ROCm headers declare `__syncwarp` with a mask argument, which the call sites do not pass, so both are macros.
+#define __activemask() 0xffffffffu
+#define __syncwarp(...) __builtin_amdgcn_wave_barrier()
 // The compiled-out sm_80+ paths still mention these; no CUDA-only helper may survive into a HIP build.
 #define __trap() __builtin_trap()
 #define __nanosleep(cycles) __builtin_amdgcn_s_sleep(1)
