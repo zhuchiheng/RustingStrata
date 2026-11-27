@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub mod preflight;
 pub mod spv_smem;
 
+/// Flushes seen so far, for STRATA_VK_PROF_EVERY. `bench` exits without dropping `Inner`, so the report in `Drop`
+/// never runs there; this lets a run print the same table periodically instead.
+static PROF_FLUSHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Host-visible buffer that host copies go through, in chunks of this size.
 const STAGING: usize = 64 << 20;
 /// Staged copies are submitted once this many bytes are queued: a submit per expert matrix costs more than the copy.
@@ -207,6 +210,9 @@ struct Inner {
     smem_limit: u32,
     /// Nanoseconds per GPU timestamp tick (`VkPhysicalDeviceLimits::timestampPeriod`).
     ts_period: f32,
+    /// STRATA_VK_PROF_GRAPH: timestamp the dispatches recorded into a graph too (decode runs from one). A timestamp
+    /// between two nodes serialises them, so a graph measured this way runs slower: the shares are indicative.
+    prof_graph: bool,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
@@ -522,7 +528,7 @@ impl Vk {
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let ts_period = limits.timestamp_period;
         let rcp_d = dev_props.vendor_id == 0x1002;
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, ts_period, stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, igpu, gfx11, wave64, rcp_d, coop, dp_tile, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_k_mode, kv_v_mode, smem_limit, prof_graph: std::env::var_os("STRATA_VK_PROF_GRAPH").is_some(), ts_period, stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -761,6 +767,22 @@ impl Inner {
                     }
                 }
             } }
+            if let Ok(n) = std::env::var("STRATA_VK_PROF_EVERY") {
+                let n: u64 = n.parse().unwrap_or(0);
+                let seen = PROF_FLUSHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n > 0 && seen % n == 0 {
+                    if let Some((_, _, tot)) = &st.prof { if !tot.is_empty() {
+                        let scale = self.ts_period as f64;
+                        let mut v: Vec<_> = tot.iter().collect(); v.sort_by_key(|x| std::cmp::Reverse(x.1.0));
+                        let all: f64 = v.iter().filter(|(k, _)| **k != "_barrier_gap").map(|x| x.1.0 as f64 * scale).sum();
+                        eprintln!("vulkan prof flush {seen} (period {:.2} ns, kernel sum {:.2} ms):", self.ts_period, all / 1e6);
+                        for (nm, (ticks, c)) in v {
+                            let ns = *ticks as f64 * scale;
+                            eprintln!("prof {nm:24} {:9.2} ms {:5.1}% {c:7} calls {:8.2} us", ns / 1e6, ns * 100.0 / all.max(1.0), ns / 1e3 / (*c).max(1) as f64);
+                        }
+                    } }
+                }
+            }
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
@@ -924,16 +946,20 @@ impl Vk {
         let p = self.0.pipeline(&mut st, name, spec)?;
         let cb = self.0.cb(&mut st)?;
         let d = &self.0.dev;
+        // STRATA_VK_PROF_GRAPH: timestamp the dispatches recorded into a graph too (decode runs from one). Off by
+        // default: a timestamp between two graph nodes serialises them, so a graph measured this way runs slower and
+        // the shares are indicative, not absolute.
+        let prof_graph = self.0.prof_graph && st.rec.is_some();
         unsafe {
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p);
             d.cmd_push_constants(cb, self.0.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
+            if st.rec.is_none() || prof_graph { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
                 if names.is_empty() { d.cmd_reset_query_pool(cb, *qp, 0, 65536); }
                 d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32); } } }
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
-        if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
+        if st.rec.is_none() || prof_graph { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
             let label = match (name, spec.get(1).copied()) {
                 ("gemv_q", Some(11)) => "gemv_q:Q3_K",
                 ("gemv_q", Some(13)) => "gemv_q:Q5_K",
